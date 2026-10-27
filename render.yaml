@@ -1,0 +1,25 @@
+# Render Blueprint: бесплатный Docker-сервис без карты.
+# Один контейнер отдаёт мини-приложение, /api/* и Telegram-бота (long polling).
+# Как задеплоить — README.md, раздел «Бесплатный хостинг на Render».
+services:
+  - type: web
+    name: vita-ratio
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      # Секрет вводится в панели Render (sync:false), в git его нет.
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOT_USERNAME
+        value: vita_ratio_bot
+      - key: APP_ENV
+        value: prod
+      - key: TIMEZONE
+        value: Europe/Moscow
+      # PORT и RENDER_EXTERNAL_URL Render подставляет сам:
+      # приложение собирает из них адрес мини-приложения для кнопки в боте.
