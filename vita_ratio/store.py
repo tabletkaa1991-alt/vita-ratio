@@ -1,0 +1,785 @@
+"""Репозитории поверх sqlite3 для Vita Ratio.
+
+Все функции синхронные, принимают открытое соединение ``sqlite3.Connection``
+(см. :mod:`vita_ratio.db`) и возвращают обычные ``dict`` / ``list[dict]``,
+готовые к JSON-сериализации. Доменная математика (цели, планы, инсайты) живёт
+в :mod:`vita_ratio.calc` — здесь только SQL и нормализация типов.
+"""
+from __future__ import annotations
+
+import sqlite3
+from datetime import date as date_cls
+from datetime import datetime, timedelta
+
+from . import calc
+
+#: Поля профиля, которые приходят из API (порядок важен для INSERT).
+PROFILE_FIELDS = (
+    "sex",
+    "age",
+    "height_cm",
+    "weight_kg",
+    "activity",
+    "goal_rate",
+    "protein_per_kg",
+    "sleep_bed",
+    "sleep_wake",
+    "reminders",
+    "timezone",
+    "goal_weight_kg",
+    "goal_date",
+    "theme_accent",
+    "theme_bg",
+    "theme_card",
+)
+
+#: Поля профиля, которые можно осознанно сбросить в NULL (пустая цель/дата).
+PROFILE_NULLABLE = frozenset({"goal_weight_kg", "goal_date"})
+
+#: Редактируемые поля занятия.
+CLASS_FIELDS = ("title", "kind", "weekday", "start_time", "duration_min", "place", "note", "active")
+
+#: Редактируемые поля блока плана дня.
+DAY_PLAN_FIELDS = ("date", "time", "title", "kind", "duration_min", "note", "done")
+
+#: Дефолтная палитра (совпадает с DEFAULTS в schema.sql и calc/UI).
+THEME_DEFAULTS = {
+    "theme_accent": "#B7F75C",
+    "theme_bg": "#0E1116",
+    "theme_card": "#151A21",
+}
+
+_PROFILE_DEFAULTS = {
+    "sex": "male",
+    "age": 25,
+    "height_cm": 175.0,
+    "weight_kg": 70.0,
+    "activity": "moderate",
+    "goal_rate": 0.35,
+    "protein_per_kg": 2.0,
+    "sleep_bed": "23:00",
+    "sleep_wake": "07:00",
+    "reminders": 1,
+    "timezone": "Europe/Moscow",
+    "goal_weight_kg": None,
+    "goal_date": None,
+    **THEME_DEFAULTS,
+}
+
+
+# --- служебные -----------------------------------------------------------------
+
+def _now_iso() -> str:
+    """Локальное время сервера без микросекунд: 2026-10-27T13:00:00."""
+    return datetime.now().replace(microsecond=0).isoformat()
+
+
+def _row(row: sqlite3.Row | None) -> dict | None:
+    return dict(row) if row is not None else None
+
+
+def _rows(rows) -> list[dict]:
+    return [dict(item) for item in rows]
+
+
+def _as_flag(value) -> int:
+    if isinstance(value, str):
+        return 0 if value.strip().lower() in {"", "0", "false", "no", "off"} else 1
+    return 1 if value else 0
+
+
+def _default_date_to(date_to: str | None) -> str:
+    return str(date_to) if date_to else calc.local_today()
+
+
+# --- пользователи ---------------------------------------------------------------
+
+def get_user(conn: sqlite3.Connection, user_id: int) -> dict | None:
+    return _row(conn.execute("SELECT * FROM users WHERE id = ?", (int(user_id),)).fetchone())
+
+
+def upsert_user(
+    conn: sqlite3.Connection,
+    user_id: int,
+    username: str | None = None,
+    first_name: str | None = None,
+    last_name: str | None = None,
+) -> dict:
+    """Создаёт пользователя или обновляет известные имена (None не затирает старое)."""
+    uid = int(user_id)
+    now = _now_iso()
+    conn.execute(
+        """
+        INSERT INTO users (id, username, first_name, last_name, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            username   = COALESCE(excluded.username, users.username),
+            first_name = COALESCE(excluded.first_name, users.first_name),
+            last_name  = COALESCE(excluded.last_name, users.last_name),
+            updated_at = excluded.updated_at
+        """,
+        (uid, username, first_name, last_name, now, now),
+    )
+    conn.commit()
+    return get_user(conn, uid) or {"id": uid}
+
+
+# --- профиль -------------------------------------------------------------------
+
+def get_profile(conn: sqlite3.Connection, user_id: int) -> dict | None:
+    return _row(
+        conn.execute("SELECT * FROM profiles WHERE user_id = ?", (int(user_id),)).fetchone()
+    )
+
+
+def upsert_profile(conn: sqlite3.Connection, user_id: int, data: dict) -> dict:
+    """Создаёт/обновляет профиль, недостающие поля берёт из текущей записи.
+
+    ``None`` в ``goal_weight_kg``/``goal_date`` — осознанный сброс цели,
+    для остальных полей ``None`` означает «не менять».
+    """
+    uid = int(user_id)
+    current = get_profile(conn, uid) or {}
+    values: dict = {}
+    for field in PROFILE_FIELDS:
+        if field in data:
+            if data[field] is None and field not in PROFILE_NULLABLE:
+                values[field] = current.get(field, _PROFILE_DEFAULTS.get(field))
+            else:
+                values[field] = data[field]
+        elif field in current:
+            values[field] = current[field]
+    for field, default in _PROFILE_DEFAULTS.items():
+        values.setdefault(field, default)
+    values["reminders"] = _as_flag(values["reminders"])
+
+    columns = ["user_id", *PROFILE_FIELDS, "updated_at"]
+    params = [uid, *[values[field] for field in PROFILE_FIELDS], _now_iso()]
+    placeholders = ", ".join("?" for _ in columns)
+    updates = ", ".join(f"{field} = excluded.{field}" for field in PROFILE_FIELDS)
+    updates += ", updated_at = excluded.updated_at"
+    conn.execute(
+        f"INSERT INTO profiles ({', '.join(columns)}) VALUES ({placeholders}) "
+        f"ON CONFLICT(user_id) DO UPDATE SET {updates}",
+        params,
+    )
+    conn.commit()
+    return get_profile(conn, uid) or {}
+
+
+# --- приёмы пищи ----------------------------------------------------------------
+
+def get_meal(conn: sqlite3.Connection, user_id: int, meal_id: int) -> dict | None:
+    return _row(
+        conn.execute(
+            "SELECT * FROM meals WHERE id = ? AND user_id = ?",
+            (int(meal_id), int(user_id)),
+        ).fetchone()
+    )
+
+
+def add_meal(
+    conn: sqlite3.Connection,
+    user_id: int,
+    date: str,
+    time: str,
+    title: str,
+    kcal: float = 0,
+    protein: float = 0,
+    fat: float = 0,
+    carbs: float = 0,
+    note: str = "",
+    grams: float = 0,
+    food_key: str = "",
+) -> dict:
+    cursor = conn.execute(
+        """
+        INSERT INTO meals (user_id, date, time, title, kcal, protein, fat, carbs, grams, food_key, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(user_id),
+            str(date),
+            str(time),
+            str(title),
+            float(kcal),
+            float(protein),
+            float(fat),
+            float(carbs),
+            float(grams or 0),
+            str(food_key or ""),
+            str(note or ""),
+        ),
+    )
+    conn.commit()
+    return get_meal(conn, user_id, int(cursor.lastrowid)) or {}
+
+
+def list_meals(conn: sqlite3.Connection, user_id: int, date: str) -> list[dict]:
+    return _rows(
+        conn.execute(
+            "SELECT * FROM meals WHERE user_id = ? AND date = ? ORDER BY time, id",
+            (int(user_id), str(date)),
+        )
+    )
+
+
+def delete_meal(conn: sqlite3.Connection, user_id: int, meal_id: int) -> bool:
+    cursor = conn.execute(
+        "DELETE FROM meals WHERE id = ? AND user_id = ?", (int(meal_id), int(user_id))
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def meal_totals(conn: sqlite3.Connection, user_id: int, date: str) -> dict:
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(kcal), 0.0)    AS kcal,
+               COALESCE(SUM(protein), 0.0) AS protein,
+               COALESCE(SUM(fat), 0.0)     AS fat,
+               COALESCE(SUM(carbs), 0.0)   AS carbs
+        FROM meals
+        WHERE user_id = ? AND date = ?
+        """,
+        (int(user_id), str(date)),
+    ).fetchone()
+    return {
+        "kcal": float(row["kcal"]),
+        "protein": float(row["protein"]),
+        "fat": float(row["fat"]),
+        "carbs": float(row["carbs"]),
+    }
+
+
+# --- сон -----------------------------------------------------------------------
+
+def get_sleep(conn: sqlite3.Connection, user_id: int, date: str) -> dict | None:
+    return _row(
+        conn.execute(
+            "SELECT * FROM sleep_logs WHERE user_id = ? AND date = ?",
+            (int(user_id), str(date)),
+        ).fetchone()
+    )
+
+
+def upsert_sleep(
+    conn: sqlite3.Connection,
+    user_id: int,
+    date: str,
+    bed_time: str,
+    wake_time: str,
+    duration_h: float | None = None,
+    quality: int = 3,
+    note: str = "",
+) -> dict:
+    """Запись сна по дате пробуждения; повторный POST обновляет её."""
+    uid = int(user_id)
+    day = str(date)
+    if duration_h is None:
+        duration_h = calc.duration_between(bed_time, wake_time)
+    conn.execute(
+        """
+        INSERT INTO sleep_logs (user_id, date, bed_time, wake_time, duration_h, quality, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, date) DO UPDATE SET
+            bed_time   = excluded.bed_time,
+            wake_time  = excluded.wake_time,
+            duration_h = excluded.duration_h,
+            quality    = excluded.quality,
+            note       = excluded.note
+        """,
+        (uid, day, str(bed_time), str(wake_time), float(duration_h), int(quality), str(note or "")),
+    )
+    conn.commit()
+    return get_sleep(conn, uid, day) or {}
+
+
+def sleep_week(conn: sqlite3.Connection, user_id: int, date_to: str, days: int = 7) -> list[dict]:
+    """Записи сна за ``days`` дней по дату ``date_to`` включительно (по возрастанию даты)."""
+    end = date_cls.fromisoformat(str(date_to))
+    start = end - timedelta(days=max(int(days), 1) - 1)
+    return _rows(
+        conn.execute(
+            """
+            SELECT * FROM sleep_logs
+            WHERE user_id = ? AND date BETWEEN ? AND ?
+            ORDER BY date
+            """,
+            (int(user_id), start.isoformat(), end.isoformat()),
+        )
+    )
+
+
+# --- вес -----------------------------------------------------------------------
+
+def get_weight(conn: sqlite3.Connection, user_id: int, date: str) -> dict | None:
+    return _row(
+        conn.execute(
+            "SELECT * FROM weights WHERE user_id = ? AND date = ?",
+            (int(user_id), str(date)),
+        ).fetchone()
+    )
+
+
+def add_weight(conn: sqlite3.Connection, user_id: int, date: str, kg: float, note: str = "") -> dict:
+    uid = int(user_id)
+    day = str(date)
+    conn.execute(
+        """
+        INSERT INTO weights (user_id, date, kg, note)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id, date) DO UPDATE SET
+            kg   = excluded.kg,
+            note = excluded.note
+        """,
+        (uid, day, float(kg), str(note or "")),
+    )
+    conn.commit()
+    return get_weight(conn, uid, day) or {}
+
+
+def list_weights(
+    conn: sqlite3.Connection,
+    user_id: int,
+    days: int = 60,
+    date_to: str | None = None,
+) -> list[dict]:
+    """Взвешивания за последние ``days`` дней (по возрастанию даты)."""
+    end = date_cls.fromisoformat(_default_date_to(date_to))
+    start = end - timedelta(days=max(int(days), 1) - 1)
+    return _rows(
+        conn.execute(
+            """
+            SELECT * FROM weights
+            WHERE user_id = ? AND date BETWEEN ? AND ?
+            ORDER BY date
+            """,
+            (int(user_id), start.isoformat(), end.isoformat()),
+        )
+    )
+
+
+def weight_trend(conn: sqlite3.Connection, user_id: int, days: int = 21, date_to: str | None = None) -> float:
+    """Тренд веса, кг/неделю: наклон линейной регрессии по датам."""
+    rows = list_weights(conn, user_id, days=days, date_to=date_to)
+    if len(rows) < 2:
+        return 0.0
+    base = date_cls.fromisoformat(rows[0]["date"])
+    xs = [float((date_cls.fromisoformat(row["date"]) - base).days) for row in rows]
+    ys = [float(row["kg"]) for row in rows]
+    if xs[-1] == xs[0]:
+        return 0.0
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    denominator = sum((x - mean_x) ** 2 for x in xs)
+    if denominator == 0:
+        return 0.0
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denominator
+    return round(slope * 7.0, 2)
+
+
+def goal_weights(
+    conn: sqlite3.Connection,
+    user_id: int,
+    profile: dict | None = None,
+    days: int = 60,
+    date_to: str | None = None,
+) -> dict:
+    """Стартовый и текущий вес для цели по весу.
+
+    Стартовый = самое старое взвешивание за ``days`` дней, текущий = последнее;
+    если взвешиваний нет — оба берутся из ``profiles.weight_kg``.
+    """
+    rows = list_weights(conn, user_id, days=days, date_to=date_to)
+    fallback = (profile or {}).get("weight_kg")
+    fallback = float(fallback) if fallback else None
+    start = float(rows[0]["kg"]) if rows else fallback
+    latest = conn.execute(
+        "SELECT kg FROM weights WHERE user_id = ? ORDER BY date DESC, id DESC LIMIT 1",
+        (int(user_id),),
+    ).fetchone()
+    current = float(latest["kg"]) if latest is not None else fallback
+    return {
+        "start_weight_kg": round(start, 1) if start else None,
+        "current_weight_kg": round(current, 1) if current else None,
+    }
+
+
+# --- занятия -------------------------------------------------------------------
+
+def get_class(conn: sqlite3.Connection, user_id: int, class_id: int) -> dict | None:
+    return _row(
+        conn.execute(
+            "SELECT * FROM classes WHERE id = ? AND user_id = ?",
+            (int(class_id), int(user_id)),
+        ).fetchone()
+    )
+
+
+def list_classes(conn: sqlite3.Connection, user_id: int, active_only: bool = False) -> list[dict]:
+    sql = "SELECT * FROM classes WHERE user_id = ?"
+    if active_only:
+        sql += " AND active = 1"
+    sql += " ORDER BY weekday, start_time, id"
+    return _rows(conn.execute(sql, (int(user_id),)))
+
+
+def create_class(
+    conn: sqlite3.Connection,
+    user_id: int,
+    title: str,
+    kind: str,
+    weekday: int,
+    start_time: str,
+    duration_min: int,
+    place: str = "",
+    note: str = "",
+    active: int | bool = 1,
+) -> dict:
+    cursor = conn.execute(
+        """
+        INSERT INTO classes (user_id, title, kind, weekday, start_time, duration_min, place, note, active)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(user_id),
+            str(title),
+            str(kind),
+            int(weekday),
+            str(start_time),
+            int(duration_min),
+            str(place or ""),
+            str(note or ""),
+            _as_flag(active),
+        ),
+    )
+    conn.commit()
+    return get_class(conn, user_id, int(cursor.lastrowid)) or {}
+
+
+def update_class(
+    conn: sqlite3.Connection,
+    user_id: int,
+    class_id: int,
+    data: dict,
+) -> dict | None:
+    """Частичное обновление занятия; None — занятие не найдено или чужое."""
+    current = get_class(conn, user_id, class_id)
+    if current is None:
+        return None
+    values = dict(current)
+    for field in CLASS_FIELDS:
+        if field in data and data[field] is not None:
+            values[field] = _as_flag(data[field]) if field == "active" else data[field]
+    conn.execute(
+        """
+        UPDATE classes
+        SET title = ?, kind = ?, weekday = ?, start_time = ?,
+            duration_min = ?, place = ?, note = ?, active = ?
+        WHERE id = ? AND user_id = ?
+        """,
+        (
+            str(values["title"]),
+            str(values["kind"]),
+            int(values["weekday"]),
+            str(values["start_time"]),
+            int(values["duration_min"]),
+            str(values["place"] or ""),
+            str(values["note"] or ""),
+            _as_flag(values["active"]),
+            int(class_id),
+            int(user_id),
+        ),
+    )
+    conn.commit()
+    return get_class(conn, user_id, class_id)
+
+
+def delete_class(conn: sqlite3.Connection, user_id: int, class_id: int) -> bool:
+    cursor = conn.execute(
+        "DELETE FROM classes WHERE id = ? AND user_id = ?", (int(class_id), int(user_id))
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def week_load_min(conn: sqlite3.Connection, user_id: int) -> int:
+    """Суммарная длительность активных занятий за неделю (каждый слот повторяется)."""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(duration_min), 0) AS minutes FROM classes WHERE user_id = ? AND active = 1",
+        (int(user_id),),
+    ).fetchone()
+    return int(row["minutes"])
+
+
+# --- посещаемость ---------------------------------------------------------------
+
+def get_class_done(conn: sqlite3.Connection, user_id: int, class_id: int, date: str) -> dict | None:
+    return _row(
+        conn.execute(
+            """
+            SELECT * FROM class_done
+            WHERE user_id = ? AND class_id = ? AND date = ?
+            """,
+            (int(user_id), int(class_id), str(date)),
+        ).fetchone()
+    )
+
+
+def done_map(
+    conn: sqlite3.Connection,
+    user_id: int,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[tuple[int, str], str]:
+    """{(class_id, date): status} для быстрой подстановки статусов в расписание."""
+    sql = "SELECT class_id, date, status FROM class_done WHERE user_id = ?"
+    params: list = [int(user_id)]
+    if date_from:
+        sql += " AND date >= ?"
+        params.append(str(date_from))
+    if date_to:
+        sql += " AND date <= ?"
+        params.append(str(date_to))
+    return {
+        (int(row["class_id"]), str(row["date"])): str(row["status"])
+        for row in conn.execute(sql, params)
+    }
+
+
+def mark_class_done(
+    conn: sqlite3.Connection,
+    user_id: int,
+    class_id: int,
+    date: str,
+    status: str = "present",
+    note: str = "",
+) -> dict | None:
+    """Отмечает посещение; None — занятие не найдено или чужое."""
+    uid = int(user_id)
+    cid = int(class_id)
+    if get_class(conn, uid, cid) is None:
+        return None
+    day = str(date)
+    conn.execute(
+        """
+        INSERT INTO class_done (user_id, class_id, date, status, note)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, class_id, date) DO UPDATE SET
+            status = excluded.status,
+            note   = excluded.note
+        """,
+        (uid, cid, day, str(status), str(note or "")),
+    )
+    conn.commit()
+    return get_class_done(conn, uid, cid, day)
+
+
+# --- напоминания ----------------------------------------------------------------
+
+def reminder_exists(conn: sqlite3.Connection, user_id: int, date: str, kind: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM reminder_log WHERE user_id = ? AND date = ? AND kind = ?",
+            (int(user_id), str(date), str(kind)),
+        ).fetchone()
+        is not None
+    )
+
+
+def mark_reminder(conn: sqlite3.Connection, user_id: int, date: str, kind: str) -> bool:
+    """Помечает напоминание отправленным; True — если оно новое (можно отправлять)."""
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO reminder_log (user_id, date, kind) VALUES (?, ?, ?)",
+        (int(user_id), str(date), str(kind)),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+# --- статистика по дням ---------------------------------------------------------
+
+def stats_days(conn: sqlite3.Connection, user_id: int, date_from: str, date_to: str) -> list[dict]:
+    """Сводка по дням: калории/БЖУ из meals и длительность/качество из sleep_logs.
+
+    Возвращает по элементу на каждый день диапазона включительно:
+    {"date", "kcal", "protein", "fat", "carbs", "meals_count", "sleep_h", "quality"}.
+    Дни без данных приходят с нулями и sleep_h=None.
+    """
+    uid = int(user_id)
+    start = date_cls.fromisoformat(str(date_from))
+    end = date_cls.fromisoformat(str(date_to))
+    if end < start:
+        start, end = end, start
+
+    meals = {
+        str(row["date"]): row
+        for row in conn.execute(
+            """
+            SELECT date,
+                   COALESCE(SUM(kcal), 0.0)    AS kcal,
+                   COALESCE(SUM(protein), 0.0) AS protein,
+                   COALESCE(SUM(fat), 0.0)     AS fat,
+                   COALESCE(SUM(carbs), 0.0)   AS carbs,
+                   COUNT(*)                    AS meals_count
+            FROM meals
+            WHERE user_id = ? AND date BETWEEN ? AND ?
+            GROUP BY date
+            """,
+            (uid, start.isoformat(), end.isoformat()),
+        )
+    }
+    sleep = {
+        str(row["date"]): row
+        for row in conn.execute(
+            """
+            SELECT date, duration_h, quality
+            FROM sleep_logs
+            WHERE user_id = ? AND date BETWEEN ? AND ?
+            """,
+            (uid, start.isoformat(), end.isoformat()),
+        )
+    }
+
+    result: list[dict] = []
+    cursor = start
+    while cursor <= end:
+        day = cursor.isoformat()
+        meal_row = meals.get(day)
+        sleep_row = sleep.get(day)
+        result.append(
+            {
+                "date": day,
+                "kcal": float(meal_row["kcal"]) if meal_row else 0.0,
+                "protein": float(meal_row["protein"]) if meal_row else 0.0,
+                "fat": float(meal_row["fat"]) if meal_row else 0.0,
+                "carbs": float(meal_row["carbs"]) if meal_row else 0.0,
+                "meals_count": int(meal_row["meals_count"]) if meal_row else 0,
+                "sleep_h": round(float(sleep_row["duration_h"]), 1) if sleep_row else None,
+                "quality": int(sleep_row["quality"]) if sleep_row else None,
+            }
+        )
+        cursor += timedelta(days=1)
+    return result
+
+
+# --- план дня (day_plans) -------------------------------------------------------
+
+def get_day_plan(conn: sqlite3.Connection, user_id: int, item_id: int) -> dict | None:
+    """Блок плана дня по id с проверкой владельца."""
+    return _row(
+        conn.execute(
+            "SELECT * FROM day_plans WHERE id = ? AND user_id = ?",
+            (int(item_id), int(user_id)),
+        ).fetchone()
+    )
+
+
+def list_day_plans(conn: sqlite3.Connection, user_id: int, date: str) -> list[dict]:
+    """Блоки плана на дату по возрастанию времени."""
+    return _rows(
+        conn.execute(
+            "SELECT * FROM day_plans WHERE user_id = ? AND date = ? ORDER BY time, id",
+            (int(user_id), str(date)),
+        )
+    )
+
+
+def day_plans_map(conn: sqlite3.Connection, user_id: int, date: str) -> dict[int, dict]:
+    """{id: блок} для быстрых проверок внутри одного запроса."""
+    return {int(row["id"]): row for row in list_day_plans(conn, user_id, date)}
+
+
+def add_day_plan(
+    conn: sqlite3.Connection,
+    user_id: int,
+    date: str,
+    time: str,
+    title: str,
+    kind: str = "other",
+    duration_min: int = 60,
+    note: str = "",
+    done: int | bool = 0,
+) -> dict:
+    cursor = conn.execute(
+        """
+        INSERT INTO day_plans (user_id, date, time, title, kind, duration_min, note, done)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(user_id),
+            str(date),
+            str(time),
+            str(title),
+            str(kind),
+            int(duration_min),
+            str(note or ""),
+            _as_flag(done),
+        ),
+    )
+    conn.commit()
+    return get_day_plan(conn, user_id, int(cursor.lastrowid)) or {}
+
+
+def update_day_plan(
+    conn: sqlite3.Connection,
+    user_id: int,
+    item_id: int,
+    data: dict,
+) -> dict | None:
+    """Частичное обновление блока; None — блок не найден или чужой."""
+    current = get_day_plan(conn, user_id, item_id)
+    if current is None:
+        return None
+    values = dict(current)
+    for field in DAY_PLAN_FIELDS:
+        if field in data and data[field] is not None:
+            values[field] = _as_flag(data[field]) if field == "done" else data[field]
+    conn.execute(
+        """
+        UPDATE day_plans
+        SET date = ?, time = ?, title = ?, kind = ?,
+            duration_min = ?, note = ?, done = ?
+        WHERE id = ? AND user_id = ?
+        """,
+        (
+            str(values["date"]),
+            str(values["time"]),
+            str(values["title"]),
+            str(values["kind"]),
+            int(values["duration_min"]),
+            str(values["note"] or ""),
+            _as_flag(values["done"]),
+            int(item_id),
+            int(user_id),
+        ),
+    )
+    conn.commit()
+    return get_day_plan(conn, user_id, item_id)
+
+
+def set_day_done(
+    conn: sqlite3.Connection,
+    user_id: int,
+    item_id: int,
+    done: int | bool = 1,
+) -> dict | None:
+    """Отмечает блок выполненным/невыполненным; None — не найден или чужой."""
+    if get_day_plan(conn, user_id, item_id) is None:
+        return None
+    conn.execute(
+        "UPDATE day_plans SET done = ? WHERE id = ? AND user_id = ?",
+        (_as_flag(done), int(item_id), int(user_id)),
+    )
+    conn.commit()
+    return get_day_plan(conn, user_id, item_id)
+
+
+def delete_day_plan(conn: sqlite3.Connection, user_id: int, item_id: int) -> bool:
+    cursor = conn.execute(
+        "DELETE FROM day_plans WHERE id = ? AND user_id = ?",
+        (int(item_id), int(user_id)),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
