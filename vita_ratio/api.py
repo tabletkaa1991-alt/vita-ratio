@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -16,7 +17,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from . import __version__, auth, calc, foods, store
+from . import __version__, auth, calc, foods, notify, store
 
 log = logging.getLogger("vita_ratio.api")
 
@@ -783,7 +784,24 @@ async def put_profile(request: web.Request) -> web.Response:
     existing = store.get_profile(conn, user["id"])
     data = _profile_payload(payload, settings, existing)
     profile = store.upsert_profile(conn, user["id"], data)
-    return json_ok({"profile": _profile_json(profile), "targets": _targets_obj(profile).to_dict()})
+    targets = _targets_obj(profile).to_dict()
+    if existing is None:
+        # Первый профиль = онбординг завершён: поздравительное сообщение в чат.
+        try:
+            task = asyncio.create_task(
+                notify.notify_registration(settings, user["id"], user.get("first_name"), targets)
+            )
+            task.add_done_callback(_log_notify_result)
+        except RuntimeError:  # нет running loop (например, в тестах)
+            pass
+    return json_ok({"profile": _profile_json(profile), "targets": targets})
+
+
+def _log_notify_result(task) -> None:
+    try:
+        task.result()
+    except Exception as exc:  # pragma: no cover - защита от необработанных исключений
+        log.warning("notify task failed: %s", exc)
 
 
 # --- приёмы пищи ----------------------------------------------------------------
