@@ -1,0 +1,7 @@
+# Vita Ratio runtime dependencies (для запуска на чистой машине: pip install -r requirements.txt)
+aiogram>=3.13,<4
+aiohttp>=3.9,<4
+# На Windows зона Europe/Moscow требует базу IANA-зон
+tzdata; platform_system == "Windows"
+# Опционально: нужен только при заданном PROXY_URL (socks5 для api.telegram.org)
+# aiohttp-socks>=0.8
