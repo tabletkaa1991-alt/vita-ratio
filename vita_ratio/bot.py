@@ -842,6 +842,32 @@ async def _set_commands(bot: Bot) -> None:
 
 # --- точка входа ---------------------------------------------------------------
 
+async def _polling_forever(bot: Bot, dispatcher: Dispatcher, initial_delay: float = 3.0) -> None:
+    """Long polling с автопереподключением.
+
+    При деплое на Render старый и новый контейнеры на секунды пересекаются: Telegram
+    отвечает ``409 Conflict``, aiogram останавливает polling и без повтора бот молчит
+    до следующего рестарта. Поэтому запускаем polling в цикле, пока задачу не отменят.
+    """
+    delay = max(0.01, float(initial_delay))
+    while True:
+        try:
+            await dispatcher.start_polling(bot)
+            log.warning("Polling завершился, перезапуск через %.0f с", delay)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - любой сбой сети/Telegram
+            log.warning(
+                "Polling упал (%s: %s), перезапуск через %.0f с",
+                type(exc).__name__,
+                str(exc)[:200],
+                delay,
+            )
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.6, 60.0)
+        log.info("Перезапуск polling")
+
+
 async def run_bot(settings_obj: Settings, conn: sqlite3.Connection | None = None) -> None:
     """Запускает бота: polling + фоновая задача напоминаний.
 
@@ -899,7 +925,7 @@ async def run_bot(settings_obj: Settings, conn: sqlite3.Connection | None = None
     log.info("Бот Vita Ratio запущен (polling)")
     try:
         await _set_commands(bot)
-        await dispatcher.start_polling(bot)
+        await _polling_forever(bot, dispatcher)
     except asyncio.CancelledError:
         log.info("Polling бота остановлен")
         raise
