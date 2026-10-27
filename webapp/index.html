@@ -1,0 +1,904 @@
+<!DOCTYPE html>
+<html lang="ru" class="theme-dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#0E1116">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Vita Ratio — питание, сон и расписание для набора массы">
+  <title>Vita Ratio · набор массы</title>
+  <!-- Палитра восстанавливается из localStorage ДО первой отрисовки — без вспышки.
+       app.js переиспользует window.__vitaTheme.apply(), правила те же. -->
+  <script>
+  (function () {
+    'use strict';
+    var HEX = /^#([0-9a-f]{6})$/i;
+    function hex(value) {
+      var text = String(value || '').trim();
+      return HEX.test(text) ? text.toUpperCase() : null;
+    }
+    function rgb(color) {
+      return [parseInt(color.slice(1, 3), 16), parseInt(color.slice(3, 5), 16), parseInt(color.slice(5, 7), 16)];
+    }
+    function toHex(parts) {
+      return '#' + parts.map(function (value) {
+        var clamped = Math.max(0, Math.min(255, Math.round(value)));
+        return ('0' + clamped.toString(16)).slice(-2);
+      }).join('').toUpperCase();
+    }
+    function mix(color, target, amount) {
+      var base = rgb(color);
+      var out = [0, 0, 0];
+      for (var i = 0; i < 3; i += 1) { out[i] = base[i] + (target[i] - base[i]) * amount; }
+      return toHex(out);
+    }
+    function luminance(color) {
+      var parts = rgb(color).map(function (value) {
+        var channel = value / 255;
+        return channel <= 0.03928 ? channel / 12.92 : Math.pow((channel + 0.055) / 1.055, 2.4);
+      });
+      return 0.2126 * parts[0] + 0.7152 * parts[1] + 0.0722 * parts[2];
+    }
+    function apply(theme) {
+      var accent = hex(theme && theme.accent) || '#B7F75C';
+      var bg = hex(theme && theme.bg) || '#0E1116';
+      var card = hex(theme && theme.card) || '#151A21';
+      var accentRgb = rgb(accent);
+      var bgRgb = rgb(bg);
+      var cardRgb = rgb(card);
+      var ink = luminance(accent) > 0.42 ? '#0E1116' : '#F2F6EF';
+      var root = document.documentElement;
+      var accentList = accentRgb.join(', ');
+      root.style.setProperty('--accent', accent);
+      root.style.setProperty('--accent-strong', mix(accent, [0, 0, 0], 0.14));
+      root.style.setProperty('--accent-ink', ink);
+      root.style.setProperty('--accent-soft', 'rgba(' + accentList + ', 0.14)');
+      root.style.setProperty('--accent-rgb', accentList);
+      root.style.setProperty('--bg', bg);
+      root.style.setProperty('--bg-rgb', bgRgb.join(', '));
+      root.style.setProperty('--bg-2', mix(bg, cardRgb, 0.55));
+      root.style.setProperty('--bg-3', mix(bg, [255, 255, 255], 0.10));
+      root.style.setProperty('--card', card);
+      root.style.setProperty('--card-2', mix(card, [255, 255, 255], 0.05));
+      root.style.setProperty('--card-rgb', cardRgb.join(', '));
+      root.style.setProperty('--border', 'rgba(' + accentList + ', 0.20)');
+      root.setAttribute('data-theme-accent', accent);
+      var meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) { meta.setAttribute('content', bg); }
+      return { accent: accent, bg: bg, card: card, accentRgb: accentRgb, bgRgb: bgRgb, cardRgb: cardRgb };
+    }
+    function readCache() {
+      try {
+        var raw = window.localStorage.getItem('vita-theme');
+        if (!raw) { return null; }
+        var parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') { return null; }
+        return { accent: hex(parsed.accent), bg: hex(parsed.bg), card: hex(parsed.card) };
+      } catch (error) {
+        return null;
+      }
+    }
+    window.__vitaTheme = { apply: apply, readCache: readCache, hex: hex, mix: mix, luminance: luminance };
+    var cached = readCache();
+    if (cached) { apply(cached); }
+  })();
+  </script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app" class="app">
+    <div id="demo-banner" class="demo-banner" hidden>
+      <span class="demo-banner__dot" aria-hidden="true"></span>
+      <span class="demo-banner__text">Демо-режим · локальные данные</span>
+    </div>
+
+    <main id="main" class="main">
+
+      <!-- ==================== СЕГОДНЯ ==================== -->
+      <section id="screen-today" class="screen is-active" data-screen="today" aria-labelledby="today-user">
+        <div id="today-skeleton" class="skeleton-wrap" aria-hidden="true">
+          <div class="skeleton skeleton--line skeleton--w60"></div>
+          <div class="skeleton skeleton--line skeleton--w40"></div>
+          <div class="skeleton skeleton--card skeleton--ring"></div>
+          <div class="skeleton skeleton--card"></div>
+          <div class="skeleton-grid">
+            <div class="skeleton skeleton--card skeleton--half"></div>
+            <div class="skeleton skeleton--card skeleton--half"></div>
+          </div>
+          <div class="skeleton skeleton--card"></div>
+        </div>
+
+        <div id="today-content" class="screen-content" hidden>
+          <header class="today-head">
+            <p id="today-greeting" class="eyebrow">Доброе утро</p>
+            <h1 id="today-user" class="title">Привет!</h1>
+            <p id="today-date" class="muted">Понедельник, 1 января</p>
+          </header>
+
+          <div id="today-error" class="card card--error" hidden>
+            <p class="card__title">Не удалось загрузить данные</p>
+            <p class="muted">Проверь, что сервер запущен, и попробуй ещё раз.</p>
+            <button type="button" id="btn-retry-today" class="btn btn--ghost">Повторить</button>
+          </div>
+
+          <article class="card card--ring" aria-label="Калории за сегодня">
+            <div class="ring-wrap">
+              <svg class="ring" viewBox="0 0 140 140" role="img" aria-label="Кольцо калорий">
+                <circle class="ring__track" cx="70" cy="70" r="58"></circle>
+                <circle id="cal-ring-value" class="ring__value" cx="70" cy="70" r="58"></circle>
+              </svg>
+              <div class="ring-label">
+                <span id="cal-eaten" class="ring-label__big">0</span>
+                <span class="ring-label__sub">из <span id="cal-goal">0</span> ккал</span>
+                <span id="cal-left" class="ring-label__hint">осталось 0</span>
+              </div>
+            </div>
+          </article>
+
+          <article id="today-goal-card" class="card card--goal" aria-label="Цель по весу">
+            <div class="card__head">
+              <p class="card__label">Цель</p>
+              <span id="today-goal-pct" class="goal-pct">0%</span>
+            </div>
+            <div id="today-goal-body">
+              <p class="goal-value"><span id="today-goal-value">—</span><span class="goal-value__unit"> кг</span></p>
+              <p id="today-goal-sub" class="muted">Цель по весу</p>
+              <div class="bar bar--thick goal-bar"><div id="today-goal-bar" class="bar__fill"></div></div>
+              <div class="row-between goal-meta">
+                <span id="today-goal-left" class="muted">—</span>
+                <span id="today-goal-days" class="muted">—</span>
+              </div>
+            </div>
+            <div id="today-goal-empty">
+              <p class="muted">Цель по весу пока не поставлена — задай её в профиле.</p>
+              <button type="button" id="btn-set-goal" class="btn btn--ghost btn--wide">Поставить цель</button>
+            </div>
+          </article>
+
+          <article class="card" aria-label="Белки, жиры, углеводы и вода">
+            <div class="macro-row">
+              <div class="macro-row__head"><span>Белки</span><b id="macro-protein-val">0 / 0 г</b></div>
+              <div class="bar"><div id="macro-protein-bar" class="bar__fill bar__fill--protein"></div></div>
+            </div>
+            <div class="macro-row">
+              <div class="macro-row__head"><span>Жиры</span><b id="macro-fat-val">0 / 0 г</b></div>
+              <div class="bar"><div id="macro-fat-bar" class="bar__fill bar__fill--fat"></div></div>
+            </div>
+            <div class="macro-row">
+              <div class="macro-row__head"><span>Углеводы</span><b id="macro-carbs-val">0 / 0 г</b></div>
+              <div class="bar"><div id="macro-carbs-bar" class="bar__fill bar__fill--carbs"></div></div>
+            </div>
+            <div class="macro-row">
+              <div class="macro-row__head"><span>Вода</span><b id="macro-water-val">норма 0 мл</b></div>
+              <div class="bar"><div id="macro-water-bar" class="bar__fill bar__fill--goal"></div></div>
+            </div>
+            <p class="micro-note">Воду отмечай в боте — здесь показана дневная норма.</p>
+          </article>
+
+          <article id="today-day-card" class="card" aria-label="Расписание дня">
+            <div class="card__head">
+              <p class="card__label">Расписание дня</p>
+              <span id="today-day-summary" class="muted">—</span>
+            </div>
+            <ul id="today-day-list" class="day-list day-list--today"></ul>
+            <p id="today-day-empty" class="empty" hidden>На сегодня блоков нет. Составь план в «Расписании».</p>
+            <button type="button" id="btn-day-plan" class="btn btn--ghost btn--wide">Весь план</button>
+          </article>
+
+          <div class="grid-2">
+            <article class="card card--compact" aria-label="Сон прошлой ночи">
+              <p class="card__label">Сон</p>
+              <div id="today-sleep-data" hidden>
+                <p id="today-sleep-hours" class="card__value">0 ч</p>
+                <p id="today-sleep-times" class="muted">23:00 – 07:00</p>
+                <p id="today-sleep-quality" class="card__hint">Качество 0/5</p>
+              </div>
+              <div id="today-sleep-empty">
+                <p class="card__value card__value--muted">—</p>
+                <p class="muted">Записи пока нет</p>
+                <button type="button" class="btn btn--link" data-goto="sleep">Записать сон</button>
+              </div>
+            </article>
+
+            <article class="card card--compact" aria-label="Ближайшее занятие">
+              <p class="card__label">Занятие</p>
+              <div id="today-class-data" hidden>
+                <p id="today-class-title" class="card__title">—</p>
+                <p id="today-class-meta" class="muted">—</p>
+                <p id="today-class-count" class="card__hint card__hint--accent">—</p>
+              </div>
+              <div id="today-class-empty">
+                <p class="card__value card__value--muted">—</p>
+                <p class="muted">Ближайших занятий нет</p>
+                <button type="button" class="btn btn--link" data-goto="schedule">Добавить</button>
+              </div>
+            </article>
+          </div>
+
+          <article class="card" aria-label="Следующий приём пищи">
+            <p class="card__label">Следующий приём</p>
+            <div id="next-meal-body" hidden>
+              <p class="row-between">
+                <span id="next-meal-title" class="card__title">—</span>
+                <span id="next-meal-meta" class="accent">—</span>
+              </p>
+              <p id="next-meal-kcal" class="muted">—</p>
+            </div>
+            <div id="next-meal-empty">
+              <p class="muted">Плана на день пока нет — добавь приёмы в разделе «Еда».</p>
+            </div>
+          </article>
+
+          <article class="card" aria-label="Советы на день">
+            <p class="card__label">Советы</p>
+            <ul id="today-insights" class="insights"></ul>
+          </article>
+
+          <div class="quick-actions">
+            <button type="button" id="btn-add-meal" class="btn btn--accent">Добавить еду</button>
+            <button type="button" id="btn-log-sleep" class="btn btn--ghost">Записать сон</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== ЕДА ==================== -->
+      <section id="screen-food" class="screen" data-screen="food" aria-labelledby="food-date-label">
+        <header class="screen-head">
+          <div>
+            <p class="eyebrow">Питание</p>
+            <h1 id="food-date-label" class="title title--sm">Сегодня</h1>
+          </div>
+          <div class="date-switch" role="group" aria-label="Переключение даты">
+            <button type="button" id="food-prev" class="icon-btn" aria-label="Предыдущий день">‹</button>
+            <button type="button" id="food-next" class="icon-btn" aria-label="Следующий день">›</button>
+          </div>
+        </header>
+
+        <div id="food-skeleton" class="skeleton-wrap" aria-hidden="true">
+          <div class="skeleton skeleton--card"></div>
+          <div class="skeleton skeleton--line skeleton--w60"></div>
+          <div class="skeleton skeleton--card"></div>
+          <div class="skeleton skeleton--card"></div>
+        </div>
+
+        <div id="food-content" class="screen-content" hidden>
+          <article class="card card--totals" aria-label="Калории за день">
+            <div class="totals-row">
+              <span>Съедено</span>
+              <b><span id="food-eaten">0</span> ккал</b>
+            </div>
+            <div class="bar bar--thick"><div id="food-progress-bar" class="bar__fill"></div></div>
+            <div class="totals-row totals-row--muted">
+              <span>Цель <span id="food-goal">0</span> ккал</span>
+              <span id="food-left">осталось 0 ккал</span>
+            </div>
+            <div class="macro-mini">
+              Б <span id="food-total-protein">0</span> г ·
+              Ж <span id="food-total-fat">0</span> г ·
+              У <span id="food-total-carbs">0</span> г
+            </div>
+          </article>
+
+          <h2 class="section-title">Приёмы пищи</h2>
+          <ul id="food-list" class="meal-list"></ul>
+          <p id="food-empty" class="empty" hidden>Пока пусто. Добавь первый приём — пресеты ускорят ввод.</p>
+
+          <button type="button" id="btn-open-meal-form" class="btn btn--accent btn--wide">+ Добавить приём</button>
+
+          <form id="meal-form" class="card form" hidden novalidate>
+            <p class="card__label">Новый приём</p>
+
+            <div id="meal-presets" class="presets presets--food" role="group" aria-label="Популярные продукты"></div>
+
+            <div class="field field--food">
+              <label for="meal-title">Что съел</label>
+              <input id="meal-title" type="text" maxlength="120" placeholder="Например, куриная грудка" autocomplete="off"
+                     role="combobox" aria-autocomplete="list" aria-controls="food-suggest" aria-expanded="false">
+              <div id="food-suggest" class="food-suggest" hidden role="listbox" aria-label="Подсказки продуктов"></div>
+              <div id="food-selected" class="food-selected" hidden>
+                <div class="food-selected__main">
+                  <p id="food-selected-name" class="food-selected__name">—</p>
+                  <p id="food-selected-per100" class="food-selected__per100">—</p>
+                </div>
+                <button type="button" id="food-selected-clear" class="mini-btn" aria-label="Убрать выбранный продукт">×</button>
+              </div>
+            </div>
+
+            <div id="meal-grams-field" class="field">
+              <label for="meal-grams">Граммы</label>
+              <div class="grams-row">
+                <button type="button" id="meal-grams-minus" class="grams-btn" aria-label="Уменьшить на 10 грамм">−10</button>
+                <input id="meal-grams" type="number" inputmode="numeric" min="5" max="3000" step="10" value="100">
+                <button type="button" id="meal-grams-plus" class="grams-btn" aria-label="Увеличить на 10 грамм">+10</button>
+              </div>
+            </div>
+
+            <p id="meal-preview" class="meal-preview">≈ 0 ккал · Б 0 · Ж 0 · У 0</p>
+
+            <div class="field-row">
+              <div class="field">
+                <label for="meal-time">Время</label>
+                <input id="meal-time" type="time" step="60">
+              </div>
+              <div class="field">
+                <label for="meal-note">Заметка</label>
+                <input id="meal-note" type="text" maxlength="200" placeholder="Необязательно" autocomplete="off">
+              </div>
+            </div>
+
+            <button type="button" id="btn-meal-manual" class="btn btn--link" aria-expanded="false">ввести вручную</button>
+
+            <div id="meal-manual" class="manual-macros" hidden>
+              <div class="field-row">
+                <div class="field">
+                  <label for="meal-kcal">Ккал</label>
+                  <input id="meal-kcal" type="number" inputmode="decimal" min="0" max="5000" step="1" placeholder="0">
+                </div>
+                <div class="field">
+                  <label for="meal-protein">Белки, г</label>
+                  <input id="meal-protein" type="number" inputmode="decimal" min="0" max="500" step="0.1" placeholder="0">
+                </div>
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="meal-fat">Жиры, г</label>
+                  <input id="meal-fat" type="number" inputmode="decimal" min="0" max="500" step="0.1" placeholder="0">
+                </div>
+                <div class="field">
+                  <label for="meal-carbs">Углеводы, г</label>
+                  <input id="meal-carbs" type="number" inputmode="decimal" min="0" max="1000" step="0.1" placeholder="0">
+                </div>
+              </div>
+              <p class="micro-note">Ручной режим: КБЖУ берётся из полей, без пересчёта по граммам.</p>
+            </div>
+
+            <p id="meal-form-error" class="form-error" hidden></p>
+            <div id="food-notfound-suggest" class="food-notfound" hidden></div>
+
+            <div class="form-actions">
+              <button type="button" id="meal-cancel" class="btn btn--ghost">Отмена</button>
+              <button type="submit" id="meal-submit" class="btn btn--accent">Добавить</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <!-- ==================== СОН ==================== -->
+      <section id="screen-sleep" class="screen" data-screen="sleep" aria-labelledby="sleep-date-label">
+        <header class="screen-head">
+          <div>
+            <p class="eyebrow">Восстановление</p>
+            <h1 id="sleep-date-label" class="title title--sm">Сон</h1>
+          </div>
+        </header>
+
+        <div id="sleep-skeleton" class="skeleton-wrap" aria-hidden="true">
+          <div class="skeleton skeleton--card"></div>
+          <div class="skeleton skeleton--card"></div>
+          <div class="skeleton skeleton--card"></div>
+        </div>
+
+        <div id="sleep-content" class="screen-content" hidden>
+          <article class="card">
+            <p class="card__label">Запись за сегодня</p>
+            <div class="field-row">
+              <div class="field">
+                <label for="sleep-bed">Отбой</label>
+                <input id="sleep-bed" type="time" step="60">
+              </div>
+              <div class="field">
+                <label for="sleep-wake">Подъём</label>
+                <input id="sleep-wake" type="time" step="60">
+              </div>
+            </div>
+            <p class="duration-line">Длительность: <b id="sleep-duration">8 ч 0 мин</b></p>
+            <div class="field">
+              <span class="field-label" id="sleep-quality-label">Качество: 3 из 5</span>
+              <div id="sleep-quality" class="stars" role="group" aria-labelledby="sleep-quality-label">
+                <button type="button" class="star" data-q="1" aria-label="Качество 1 из 5" aria-pressed="false">★</button>
+                <button type="button" class="star" data-q="2" aria-label="Качество 2 из 5" aria-pressed="false">★</button>
+                <button type="button" class="star" data-q="3" aria-label="Качество 3 из 5" aria-pressed="true">★</button>
+                <button type="button" class="star" data-q="4" aria-label="Качество 4 из 5" aria-pressed="false">★</button>
+                <button type="button" class="star" data-q="5" aria-label="Качество 5 из 5" aria-pressed="false">★</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="sleep-note">Заметка</label>
+              <input id="sleep-note" type="text" maxlength="200" placeholder="Например, проснулся ночью" autocomplete="off">
+            </div>
+            <button type="button" id="sleep-submit" class="btn btn--accent btn--wide">Сохранить сон</button>
+          </article>
+
+          <article class="card" aria-label="Синхронизация сна и питания">
+            <p class="card__label">Синхронизация</p>
+            <p id="sleep-sync-window" class="sync-line">Окно питания: —</p>
+            <p id="sleep-sync-last" class="sync-line">Последний приём: —</p>
+            <p id="sleep-sync-rule" class="sync-line sync-line--ok">Правило: последний приём за 2 ч до сна.</p>
+          </article>
+
+          <article class="card" aria-label="Сон за неделю">
+            <div class="card__head">
+              <p class="card__label">Сон за неделю</p>
+              <span class="muted"><span id="sleep-avg">—</span> · <span id="sleep-debt">—</span></span>
+            </div>
+            <div id="sleep-week-chart" class="chart"></div>
+            <p id="sleep-week-empty" class="empty" hidden>Пока нет записей сна — добавь первую запись выше.</p>
+          </article>
+        </div>
+      </section>
+
+      <!-- ==================== РАСПИСАНИЕ ==================== -->
+      <section id="screen-schedule" class="screen" data-screen="schedule" aria-labelledby="schedule-week-label">
+        <header class="screen-head">
+          <div>
+            <p class="eyebrow">Режим</p>
+            <h1 id="schedule-week-label" class="title title--sm">Расписание</h1>
+          </div>
+          <button type="button" id="btn-add-class" class="icon-btn icon-btn--accent" aria-label="Добавить занятие">+</button>
+        </header>
+
+        <div id="schedule-skeleton" class="skeleton-wrap" aria-hidden="true">
+          <div class="skeleton skeleton--card"></div>
+          <div class="skeleton skeleton--card"></div>
+          <div class="skeleton skeleton--card"></div>
+        </div>
+
+        <div id="schedule-content" class="screen-content" hidden>
+          <div id="schedule-segments" class="seg-tabs" role="tablist" aria-label="Вид расписания">
+            <button type="button" id="schedule-seg-day" class="seg-tabs__btn is-active" data-segment="day"
+                    role="tab" aria-selected="true" aria-controls="schedule-day-panel">День</button>
+            <button type="button" id="schedule-seg-week" class="seg-tabs__btn" data-segment="week"
+                    role="tab" aria-selected="false" aria-controls="schedule-week-panel">Неделя</button>
+          </div>
+
+          <div id="schedule-day-panel" class="seg-panel" role="tabpanel" aria-labelledby="schedule-seg-day">
+            <article class="card" aria-label="План дня">
+              <div class="card__head">
+                <p id="day-plan-label" class="card__label">Сегодня</p>
+                <span id="day-plan-summary" class="muted">—</span>
+              </div>
+              <ul id="day-timeline" class="day-list"></ul>
+              <p id="day-timeline-empty" class="empty" hidden>На сегодня блоков нет. Добавь первый — или возьми из рекомендаций.</p>
+              <button type="button" id="btn-add-day-item" class="btn btn--ghost btn--wide">+ Добавить блок</button>
+            </article>
+
+            <article id="day-suggest-card" class="card" aria-label="Рекомендации на день">
+              <p class="card__label">Рекомендую добавить</p>
+              <ul id="day-suggestions" class="suggest-list"></ul>
+              <p id="day-suggestions-empty" class="empty" hidden>Пока нечего рекомендовать — заполни профиль и план питания.</p>
+            </article>
+
+            <form id="day-item-form" class="card form" hidden novalidate>
+              <p id="day-item-heading" class="card__label">Новый блок дня</p>
+              <input id="day-item-id" type="hidden" value="">
+              <div class="field">
+                <label for="day-item-title">Название</label>
+                <input id="day-item-title" type="text" maxlength="120" placeholder="Например, зал: день ног" autocomplete="off">
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="day-item-time">Время</label>
+                  <input id="day-item-time" type="time" step="60" value="12:00">
+                </div>
+                <div class="field">
+                  <label for="day-item-kind">Тип</label>
+                  <select id="day-item-kind">
+                    <option value="meal">Еда</option>
+                    <option value="gym">Тренировка</option>
+                    <option value="study">Учёба</option>
+                    <option value="sleep">Сон</option>
+                    <option value="work">Дела</option>
+                    <option value="other">Другое</option>
+                  </select>
+                </div>
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="day-item-duration">Длительность, мин</label>
+                  <input id="day-item-duration" type="number" inputmode="numeric" min="5" max="720" step="5" value="30">
+                </div>
+                <div class="field">
+                  <label for="day-item-note">Заметка</label>
+                  <input id="day-item-note" type="text" maxlength="200" placeholder="Необязательно" autocomplete="off">
+                </div>
+              </div>
+              <div class="form-actions">
+                <button type="button" id="day-item-cancel" class="btn btn--ghost">Отмена</button>
+                <button type="button" id="day-item-delete" class="btn btn--danger" hidden>Удалить</button>
+                <button type="submit" id="day-item-submit" class="btn btn--accent">Сохранить</button>
+              </div>
+            </form>
+          </div>
+
+          <div id="schedule-week-panel" class="seg-panel" role="tabpanel" aria-labelledby="schedule-seg-week" hidden>
+          <article class="card" aria-label="Статистика недели">
+            <div class="stat-grid">
+              <div>
+                <p class="stat__value" id="week-load">0 мин</p>
+                <p class="stat__label">нагрузка</p>
+              </div>
+              <div>
+                <p class="stat__value" id="week-done">0 из 0</p>
+                <p class="stat__label">посещено</p>
+              </div>
+              <div>
+                <p class="stat__value" id="week-missed">0</p>
+                <p class="stat__label">пропущено</p>
+              </div>
+            </div>
+            <ul id="week-by-kind" class="kind-stats"></ul>
+          </article>
+
+          <article class="card" aria-label="Недельная сетка занятий">
+            <div id="schedule-grid" class="week-grid"></div>
+          </article>
+
+          <article class="card" aria-label="Занятия выбранного дня">
+            <div class="card__head">
+              <p id="day-label" class="card__label">Сегодня</p>
+              <button type="button" id="btn-add-class-day" class="btn btn--link">+ занятие</button>
+            </div>
+            <ul id="day-classes" class="class-list"></ul>
+            <p id="day-empty" class="empty" hidden>На этот день занятий нет.</p>
+          </article>
+
+          <form id="class-form" class="card form" hidden novalidate>
+            <p id="class-form-heading" class="card__label">Новое занятие</p>
+            <input id="class-id" type="hidden" value="">
+            <div class="field">
+              <label for="class-title">Название</label>
+              <input id="class-title" type="text" maxlength="120" placeholder="Например, зал: день ног" autocomplete="off">
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label for="class-kind">Тип</label>
+                <select id="class-kind">
+                  <option value="gym">Тренировка</option>
+                  <option value="study">Учёба</option>
+                  <option value="other">Другое</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="class-weekday">День</label>
+                <select id="class-weekday">
+                  <option value="0">Понедельник</option>
+                  <option value="1">Вторник</option>
+                  <option value="2">Среда</option>
+                  <option value="3">Четверг</option>
+                  <option value="4">Пятница</option>
+                  <option value="5">Суббота</option>
+                  <option value="6">Воскресенье</option>
+                </select>
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label for="class-start">Время</label>
+                <input id="class-start" type="time" step="60" value="18:00">
+              </div>
+              <div class="field">
+                <label for="class-duration">Длительность, мин</label>
+                <input id="class-duration" type="number" inputmode="numeric" min="15" max="480" step="5" value="60">
+              </div>
+            </div>
+            <div class="field">
+              <label for="class-place">Место</label>
+              <input id="class-place" type="text" maxlength="120" placeholder="Например, Fitness" autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="class-note">Заметка</label>
+              <input id="class-note" type="text" maxlength="200" placeholder="Необязательно" autocomplete="off">
+            </div>
+            <div class="form-actions">
+              <button type="button" id="class-cancel" class="btn btn--ghost">Отмена</button>
+              <button type="button" id="class-delete" class="btn btn--danger" hidden>Удалить</button>
+              <button type="submit" id="class-submit" class="btn btn--accent">Сохранить</button>
+            </div>
+          </form>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== ПРОГРЕСС ==================== -->
+      <section id="screen-progress" class="screen" data-screen="progress" aria-labelledby="progress-title">
+        <header class="screen-head">
+          <div>
+            <p class="eyebrow">Результат</p>
+            <h1 id="progress-title" class="title title--sm">Прогресс</h1>
+          </div>
+        </header>
+
+        <div id="progress-skeleton" class="skeleton-wrap" aria-hidden="true">
+          <div class="skeleton skeleton--card"></div>
+          <div class="skeleton skeleton--card"></div>
+          <div class="skeleton skeleton--card"></div>
+          <div class="skeleton skeleton--card"></div>
+        </div>
+
+        <div id="progress-content" class="screen-content" hidden>
+          <article class="card" aria-label="Вес">
+            <div class="card__head">
+              <p class="card__label">Вес</p>
+              <span class="muted"><b id="weight-current" class="accent">—</b></span>
+            </div>
+            <div id="weight-chart-wrap" class="chart chart--weight">
+              <svg id="weight-chart" class="chart__svg" viewBox="0 0 340 170" role="img" aria-label="График веса">
+                <g id="weight-grid" class="chart__grid"></g>
+                <polyline id="weight-line" class="chart__line" points=""></polyline>
+                <g id="weight-dots" class="chart__dots"></g>
+              </svg>
+            </div>
+            <p id="weight-empty" class="empty" hidden>Вес пока не записан. Добавь первую точку — и график оживёт.</p>
+            <div class="row-between">
+              <span class="muted">Тренд</span>
+              <span id="weight-trend" class="accent">—</span>
+            </div>
+            <form id="weight-form" class="form form--inline" novalidate>
+              <div class="field-row">
+                <div class="field">
+                  <label for="weight-kg">Вес, кг</label>
+                  <input id="weight-kg" type="number" inputmode="decimal" min="25" max="400" step="0.1" placeholder="72,5">
+                </div>
+                <div class="field">
+                  <label for="weight-date">Дата</label>
+                  <input id="weight-date" type="date">
+                </div>
+              </div>
+              <button type="submit" id="weight-submit" class="btn btn--accent btn--wide">Записать вес</button>
+            </form>
+          </article>
+
+          <article class="card" aria-label="Калории за 14 дней">
+            <div class="card__head">
+              <p class="card__label">Калории · 14 дней</p>
+              <span class="muted" id="stats-avg-kcal-label">среднее <b id="stats-avg-kcal">—</b></span>
+            </div>
+            <div id="cal-bars" class="chart"></div>
+            <div class="goal-line-legend muted">Пунктир — цель <span id="cal-goal-line-label">—</span></div>
+          </article>
+
+          <article class="card" aria-label="Сон за 14 дней">
+            <div class="card__head">
+              <p class="card__label">Сон · 14 дней</p>
+              <span class="muted">среднее <b id="stats-avg-sleep">—</b></span>
+            </div>
+            <div id="sleep-bars" class="chart"></div>
+            <div class="goal-line-legend muted">Пунктир — норма 8 ч</div>
+          </article>
+
+          <article class="card" aria-label="Средние показатели и выполнение целей">
+            <div class="card__head">
+              <p class="card__label">Средние</p>
+              <span class="muted" id="stats-days-count">—</span>
+            </div>
+            <div class="stat-grid">
+              <div>
+                <p class="stat__value" id="stats-avg-protein">—</p>
+                <p class="stat__label">белка, г/день</p>
+              </div>
+              <div>
+                <p class="stat__value" id="stats-adherence">—</p>
+                <p class="stat__label">дней в цели</p>
+              </div>
+            </div>
+            <div class="adherence-row">
+              <div class="adherence-row__head"><span>Калории</span><b id="stats-kcal-pct">—</b></div>
+              <div class="bar"><div id="bar-kcal-adherence" class="bar__fill"></div></div>
+            </div>
+            <div class="adherence-row">
+              <div class="adherence-row__head"><span>Сон</span><b id="stats-sleep-pct">—</b></div>
+              <div class="bar"><div id="bar-sleep-adherence" class="bar__fill bar__fill--sleep"></div></div>
+            </div>
+          </article>
+
+          <article class="card" aria-label="Профиль и цели">
+            <div class="card__head">
+              <p class="card__label">Профиль</p>
+              <span class="muted">цели пересчитываются автоматически</span>
+            </div>
+            <p id="prof-summary" class="profile-summary">—</p>
+            <form id="profile-form" class="form" novalidate>
+              <div class="field-row">
+                <div class="field">
+                  <label for="prof-sex">Пол</label>
+                  <select id="prof-sex">
+                    <option value="male">Мужской</option>
+                    <option value="female">Женский</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="prof-age">Возраст</label>
+                  <input id="prof-age" type="number" inputmode="numeric" min="10" max="100" step="1">
+                </div>
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="prof-height">Рост, см</label>
+                  <input id="prof-height" type="number" inputmode="decimal" min="100" max="250" step="0.5">
+                </div>
+                <div class="field">
+                  <label for="prof-weight">Вес, кг</label>
+                  <input id="prof-weight" type="number" inputmode="decimal" min="25" max="400" step="0.1">
+                </div>
+              </div>
+              <div class="field">
+                <label for="prof-activity">Активность</label>
+                <select id="prof-activity">
+                  <option value="sedentary">Сидячий (офис, без спорта)</option>
+                  <option value="light">Лёгкая активность (1–2 тренировки)</option>
+                  <option value="moderate">Средняя (3–4 тренировки)</option>
+                  <option value="high">Высокая (5–6 тренировок)</option>
+                  <option value="athlete">Очень высокая (спорт, физический труд)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="prof-rate">Темп набора: <b id="prof-rate-label">0,35 кг/нед</b></label>
+                <input id="prof-rate" type="range" min="0.1" max="1" step="0.05" value="0.35">
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="prof-goal-weight">Цель по весу, кг</label>
+                  <input id="prof-goal-weight" type="number" inputmode="decimal" min="30" max="300" step="0.1" placeholder="80">
+                </div>
+                <div class="field">
+                  <label for="prof-goal-date">Дата цели</label>
+                  <input id="prof-goal-date" type="date">
+                </div>
+              </div>
+              <p class="micro-note">Цель необязательна: пустые поля уберут её с экрана «Сегодня».</p>
+              <button type="submit" id="prof-submit" class="btn btn--accent btn--wide">Сохранить профиль</button>
+            </form>
+          </article>
+
+          <article class="card" aria-label="Оформление">
+            <div class="card__head">
+              <p class="card__label">Оформление</p>
+              <span id="theme-status" class="muted">палитра · lime</span>
+            </div>
+            <div id="palette-presets" class="palette-grid" role="group" aria-label="Пресеты палитры"></div>
+            <div class="palette-custom">
+              <label class="palette-color" for="color-accent">
+                <span>Акцент</span>
+                <input id="color-accent" type="color" value="#B7F75C">
+              </label>
+              <label class="palette-color" for="color-bg">
+                <span>Фон</span>
+                <input id="color-bg" type="color" value="#0E1116">
+              </label>
+              <label class="palette-color" for="color-card">
+                <span>Карточки</span>
+                <input id="color-card" type="color" value="#151A21">
+              </label>
+            </div>
+            <button type="button" id="btn-theme-reset" class="btn btn--ghost btn--wide">Сбросить</button>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <nav class="tabbar" aria-label="Основная навигация">
+      <button type="button" class="tab is-active" data-screen="today" aria-label="Сегодня" aria-current="page">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11.2 12 4l8 7.2V20a1 1 0 0 1-1 1h-5v-6h-4v6H5a1 1 0 0 1-1-1z"/></svg>
+        <span>Сегодня</span>
+      </button>
+      <button type="button" class="tab" data-screen="food" aria-label="Еда">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3v8M10 3v8M7 11v10M18 3c-2 2-2.5 5-2.5 7.5S17 14 18 14s2.5-.5 2.5-3.5S20 5 18 3z"/></svg>
+        <span>Еда</span>
+      </button>
+      <button type="button" class="tab" data-screen="sleep" aria-label="Сон">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4 8.5 8.5 0 1 0 20 14.5z"/></svg>
+        <span>Сон</span>
+      </button>
+      <button type="button" class="tab" data-screen="schedule" aria-label="Расписание">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1zM4 9h16M8 2v4M16 2v4M8 13h3M8 17h3"/></svg>
+        <span>Расписание</span>
+      </button>
+      <button type="button" class="tab" data-screen="progress" aria-label="Прогресс">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V9M10 20V5M16 20v-7M22 20H2"/></svg>
+        <span>Прогресс</span>
+      </button>
+    </nav>
+  </div>
+
+  <div id="toast-container" class="toasts" role="status" aria-live="polite"></div>
+
+  <!-- ==================== ОНБОРДИНГ ==================== -->
+  <section id="onboarding" class="onb" aria-labelledby="onb-title" hidden>
+    <div class="onb__inner">
+      <header class="onb__head">
+        <p id="onb-step-label" class="eyebrow">Шаг 1 из 4</p>
+        <h1 id="onb-title" class="title">Настроим Vita Ratio</h1>
+        <p class="muted">Четыре шага — и посчитаем твои цели.</p>
+        <div id="onb-dots" class="onb__dots" aria-hidden="true"></div>
+      </header>
+
+      <div id="onb-step-1" class="onb__step">
+        <h2 class="onb__step-title">Расскажи о себе</h2>
+        <div class="field">
+          <span class="field-label">Пол</span>
+          <div class="segmented" role="group" aria-label="Пол">
+            <label class="segmented__item">
+              <input type="radio" name="onb-sex" value="male" id="onb-sex-male" checked>
+              <span>Мужской</span>
+            </label>
+            <label class="segmented__item">
+              <input type="radio" name="onb-sex" value="female" id="onb-sex-female">
+              <span>Женский</span>
+            </label>
+          </div>
+        </div>
+        <div class="field-row field-row--3">
+          <div class="field">
+            <label for="onb-age">Возраст</label>
+            <input id="onb-age" type="number" inputmode="numeric" min="10" max="100" step="1" value="25">
+          </div>
+          <div class="field">
+            <label for="onb-height">Рост, см</label>
+            <input id="onb-height" type="number" inputmode="decimal" min="100" max="250" step="0.5" value="175">
+          </div>
+          <div class="field">
+            <label for="onb-weight">Вес, кг</label>
+            <input id="onb-weight" type="number" inputmode="decimal" min="25" max="400" step="0.1" value="70">
+          </div>
+        </div>
+      </div>
+
+      <div id="onb-step-2" class="onb__step" hidden>
+        <h2 class="onb__step-title">Активность и темп набора</h2>
+        <div class="field">
+          <label for="onb-activity">Активность</label>
+          <select id="onb-activity">
+            <option value="sedentary">Сидячий (офис, без спорта)</option>
+            <option value="light">Лёгкая активность (1–2 тренировки)</option>
+            <option value="moderate" selected>Средняя (3–4 тренировки)</option>
+            <option value="high">Высокая (5–6 тренировок)</option>
+            <option value="athlete">Очень высокая (спорт, физический труд)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="onb-rate">Темп набора: <b id="onb-rate-label">0,35 кг/нед</b></label>
+          <input id="onb-rate" type="range" min="0.1" max="1" step="0.05" value="0.35">
+          <p class="micro-note">0,25–0,5 кг/нед — чистый набор без лишнего жира.</p>
+        </div>
+      </div>
+
+      <div id="onb-step-3" class="onb__step" hidden>
+        <h2 class="onb__step-title">Режим сна</h2>
+        <div class="field-row">
+          <div class="field">
+            <label for="onb-bed">Отбой</label>
+            <input id="onb-bed" type="time" step="60" value="23:00">
+          </div>
+          <div class="field">
+            <label for="onb-wake">Подъём</label>
+            <input id="onb-wake" type="time" step="60" value="07:00">
+          </div>
+        </div>
+        <p class="micro-note">От режима сна зависят окно питания, план приёмов и напоминания.</p>
+        <label class="switch-row">
+          <input id="onb-reminders" type="checkbox" checked>
+          <span>Напоминать о еде и сне в боте</span>
+        </label>
+      </div>
+
+      <div id="onb-step-4" class="onb__step" hidden>
+        <h2 class="onb__step-title">Всё верно?</h2>
+        <div id="onb-summary" class="summary"></div>
+        <p class="micro-note">Цели по калориям, БЖУ и воде рассчитает сервер — их можно изменить в «Прогрессе».</p>
+      </div>
+
+      <p id="onb-error" class="form-error" hidden></p>
+
+      <div class="onb__actions">
+        <button type="button" id="onb-back" class="btn btn--ghost" hidden>Назад</button>
+        <button type="button" id="onb-next" class="btn btn--accent">Дальше</button>
+        <button type="button" id="onb-submit" class="btn btn--accent" hidden>Сохранить и начать</button>
+      </div>
+    </div>
+  </section>
+
+  <script src="https://telegram.org/js/telegram-web-app.js" onerror="window.__tgSdkFailed = true;"></script>
+  <script src="telegram-shim.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
