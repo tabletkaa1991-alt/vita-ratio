@@ -20,6 +20,7 @@ MIGRATIONS: dict[str, dict[str, str]] = {
     "meals": {
         "grams": "REAL NOT NULL DEFAULT 0",
         "food_key": "TEXT NOT NULL DEFAULT ''",
+        "items_json": "TEXT NOT NULL DEFAULT '[]'",
     },
 }
 

@@ -135,7 +135,7 @@
             </div>
           </article>
 
-          <article id="today-goal-card" class="card card--goal" aria-label="Цель по весу">
+          <article id="today-goal-card" class="card card--goal" data-tone="muted" aria-label="Цель по весу">
             <div class="card__head">
               <p class="card__label">Цель</p>
               <span id="today-goal-pct" class="goal-pct">0%</span>
@@ -148,11 +148,30 @@
                 <span id="today-goal-left" class="muted">—</span>
                 <span id="today-goal-days" class="muted">—</span>
               </div>
+              <p id="today-goal-status" class="goal-status goal-status--muted">—</p>
+              <p id="today-goal-hint" class="goal-hint" hidden></p>
+              <button type="button" id="btn-edit-goal" class="btn btn--ghost btn--wide goal-edit-btn">Изменить цель</button>
             </div>
             <div id="today-goal-empty">
-              <p class="muted">Цель по весу пока не поставлена — задай её в профиле.</p>
+              <p class="muted">Цель по весу пока не поставлена — задай её здесь или в профиле.</p>
               <button type="button" id="btn-set-goal" class="btn btn--ghost btn--wide">Поставить цель</button>
             </div>
+            <form id="today-goal-editor" class="goal-editor" hidden novalidate>
+              <p class="goal-editor__title">Цель по весу</p>
+              <div class="field">
+                <label for="today-goal-input-weight">Цель по весу, кг</label>
+                <input id="today-goal-input-weight" type="number" inputmode="decimal" min="30" max="300" step="0.1" placeholder="80">
+              </div>
+              <div class="field">
+                <label for="today-goal-input-date">Дата цели</label>
+                <input id="today-goal-input-date" type="date">
+              </div>
+              <p id="today-goal-error" class="form-error" hidden></p>
+              <div class="form-actions">
+                <button type="button" id="today-goal-cancel" class="btn btn--ghost">Отмена</button>
+                <button type="submit" id="today-goal-save" class="btn btn--accent">Сохранить</button>
+              </div>
+            </form>
           </article>
 
           <article class="card" aria-label="Белки, жиры, углеводы и вода">
@@ -290,30 +309,9 @@
 
             <div id="meal-presets" class="presets presets--food" role="group" aria-label="Популярные продукты"></div>
 
-            <div class="field field--food">
-              <label for="meal-title">Что съел</label>
-              <input id="meal-title" type="text" maxlength="120" placeholder="Например, куриная грудка" autocomplete="off"
-                     role="combobox" aria-autocomplete="list" aria-controls="food-suggest" aria-expanded="false">
-              <div id="food-suggest" class="food-suggest" hidden role="listbox" aria-label="Подсказки продуктов"></div>
-              <div id="food-selected" class="food-selected" hidden>
-                <div class="food-selected__main">
-                  <p id="food-selected-name" class="food-selected__name">—</p>
-                  <p id="food-selected-per100" class="food-selected__per100">—</p>
-                </div>
-                <button type="button" id="food-selected-clear" class="mini-btn" aria-label="Убрать выбранный продукт">×</button>
-              </div>
-            </div>
-
-            <div id="meal-grams-field" class="field">
-              <label for="meal-grams">Граммы</label>
-              <div class="grams-row">
-                <button type="button" id="meal-grams-minus" class="grams-btn" aria-label="Уменьшить на 10 грамм">−10</button>
-                <input id="meal-grams" type="number" inputmode="numeric" min="5" max="3000" step="10" value="100">
-                <button type="button" id="meal-grams-plus" class="grams-btn" aria-label="Увеличить на 10 грамм">+10</button>
-              </div>
-            </div>
-
-            <p id="meal-preview" class="meal-preview">≈ 0 ккал · Б 0 · Ж 0 · У 0</p>
+            <div id="meal-items" class="meal-items" aria-label="Ингредиенты приёма"></div>
+            <button type="button" id="meal-add-item" class="btn btn--ghost btn--wide meal-add-item">+ ещё ингредиент</button>
+            <p id="meal-total" class="meal-total" aria-live="polite">Итого: 0 ккал · Б 0 · Ж 0 · У 0</p>
 
             <div class="field-row">
               <div class="field">
@@ -329,6 +327,10 @@
             <button type="button" id="btn-meal-manual" class="btn btn--link" aria-expanded="false">ввести вручную</button>
 
             <div id="meal-manual" class="manual-macros" hidden>
+              <div class="field">
+                <label for="meal-title">Что съел</label>
+                <input id="meal-title" type="text" maxlength="120" placeholder="Например, куриная грудка" autocomplete="off">
+              </div>
               <div class="field-row">
                 <div class="field">
                   <label for="meal-kcal">Ккал</label>
@@ -801,6 +803,57 @@
   </div>
 
   <div id="toast-container" class="toasts" role="status" aria-live="polite"></div>
+
+  <!-- ==================== ОБЯЗАТЕЛЬНЫЙ НЕДЕЛЬНЫЙ ЧЕК-ИН ==================== -->
+  <!-- Модалку нельзя закрыть: нет крестика, backdrop/Escape игнорируются (CONTRACT §16.3). -->
+  <div id="weekly-modal" class="modal weekly-modal" role="dialog" aria-modal="true"
+       aria-labelledby="weekly-title" aria-describedby="weekly-sub" data-dismissible="false" hidden>
+    <div class="modal__panel weekly-modal__panel">
+      <p class="eyebrow">Недельный чек-ин</p>
+      <h2 id="weekly-title" class="modal__title">Раз в неделю — обязательный контроль прогресса</h2>
+      <p id="weekly-sub" class="muted">Взвесься и отметь самочувствие: от этого зависят КБЖУ и статус цели.</p>
+      <p id="weekly-last" class="weekly-last" hidden>—</p>
+
+      <form id="weekly-form" class="form weekly-form" novalidate>
+        <div class="field">
+          <label for="weekly-weight">Текущий вес, кг</label>
+          <input id="weekly-weight" type="number" inputmode="decimal" min="30" max="300" step="0.1"
+                 required placeholder="82,4">
+        </div>
+
+        <div class="field">
+          <span class="field-label" id="weekly-feel-label">Самочувствие</span>
+          <div id="weekly-feel" class="segmented segmented--3" role="group" aria-labelledby="weekly-feel-label">
+            <label class="segmented__item">
+              <input type="radio" name="weekly-feel" id="weekly-feel-good" value="good">
+              <span>Хорошо</span>
+            </label>
+            <label class="segmented__item">
+              <input type="radio" name="weekly-feel" id="weekly-feel-ok" value="ok" checked>
+              <span>Нормально</span>
+            </label>
+            <label class="segmented__item">
+              <input type="radio" name="weekly-feel" id="weekly-feel-bad" value="bad">
+              <span>Плохо</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="weekly-note">Заметка</label>
+          <input id="weekly-note" type="text" maxlength="200" placeholder="Необязательно" autocomplete="off">
+        </div>
+
+        <label class="switch-row">
+          <input id="weekly-recalc" type="checkbox" checked>
+          <span>Пересчитать КБЖУ по новому весу</span>
+        </label>
+
+        <p id="weekly-error" class="form-error" hidden></p>
+        <button type="submit" id="weekly-save" class="btn btn--accent btn--wide">Сохранить прогресс</button>
+      </form>
+    </div>
+  </div>
 
   <!-- ==================== ОНБОРДИНГ ==================== -->
   <section id="onboarding" class="onb" aria-labelledby="onb-title" hidden>

@@ -68,16 +68,22 @@
     tab: 'today',
     bootstrap: null,
     bootstrapLoading: false,
+    bootstrapReload: false,
     todayDate: todayIso(),
     nextClass: null,
     food: {
       date: todayIso(),
       data: null,
       loading: false,
-      search: { query: '', items: [], loading: false, timer: null, active: -1 },
-      selected: null,
-      grams: 100,
-      manual: false
+      manual: false,
+      rowSeq: 0,
+      items: [],
+      notFound: []
+    },
+    weekly: {
+      shown: false,
+      busy: false,
+      saved: false
     },
     sleep: { quality: 3, data: null, plan: null, meals: null, loading: false },
     schedule: {
@@ -706,8 +712,14 @@
 
   /* ======================= bootstrap и профиль ======================= */
 
-  function loadBootstrap() {
-    if (state.bootstrapLoading) { return; }
+  function loadBootstrap(options) {
+    var opts = options || {};
+    if (state.bootstrapLoading) {
+      /* Форс-перезагрузка (после сохранения цели/чек-ина): если запрос уже
+         летит, повторим его по завершении, иначе карточка останется старой. */
+      if (opts.force) { state.bootstrapReload = true; }
+      return;
+    }
     var firstLoad = !state.bootstrap;
     if (firstLoad) {
       setScreenLoading('today', true);
@@ -733,12 +745,21 @@
       byId('today-content').classList.remove('is-error');
       renderToday();
       refreshAuxScreens();
+      handleWeeklyDue(state.bootstrap);
+      if (state.bootstrapReload) {
+        state.bootstrapReload = false;
+        loadBootstrap();
+      }
     }).catch(function (error) {
       state.bootstrapLoading = false;
       setScreenLoading('today', false);
       byId('today-content').classList.add('is-error');
       byId('today-error').hidden = false;
       toast(errorText(error.code), 'error');
+      if (state.bootstrapReload) {
+        state.bootstrapReload = false;
+        loadBootstrap();
+      }
     });
   }
 
@@ -956,19 +977,89 @@
 
   /* ======================= цель и план дня (общие рендеры) ======================= */
 
+  /* ---------- цель: статус, тон шкалы и inline-редактор ---------- */
+
+  var GOAL_TONES = { good: true, warn: true, bad: true, muted: true };
+
+  function goalTone(goal) {
+    if (!goal || !goal.enabled) { return 'muted'; }
+    var status = goal.status;
+    if (status && GOAL_TONES[status.tone]) { return status.tone; }
+    return 'muted';
+  }
+
+  function goalEditorOpen() {
+    var editor = byId('today-goal-editor');
+    return !!(editor && !editor.hidden);
+  }
+
+  function goalEditorVisible(visible, goal) {
+    var editor = byId('today-goal-editor');
+    var body = byId('today-goal-body');
+    var empty = byId('today-goal-empty');
+    if (!editor || !body || !empty) { return; }
+    var enabled = !!(goal && goal.enabled);
+    if (visible) {
+      editor.hidden = false;
+      body.hidden = true;
+      empty.hidden = true;
+      return;
+    }
+    editor.hidden = true;
+    body.hidden = !enabled;
+    empty.hidden = enabled;
+  }
+
+  function renderGoalStatus(goal) {
+    var enabled = !!(goal && goal.enabled);
+    var status = goal && goal.status ? goal.status : null;
+    var tone = goalTone(goal);
+    var label = '';
+    var hint = '';
+    if (status) {
+      label = status.label || '';
+      hint = status.hint || '';
+      if (status.code === 'no_data') { label = label || 'Нужны взвешивания'; }
+    } else if (enabled) {
+      label = 'Цель активна';
+    }
+    var statusNode = byId('today-goal-status');
+    if (statusNode) {
+      statusNode.textContent = enabled ? (label || '—') : '';
+      statusNode.hidden = !enabled;
+      statusNode.className = 'goal-status goal-status--' + (enabled ? tone : 'muted');
+    }
+    var hintNode = byId('today-goal-hint');
+    if (hintNode) {
+      hintNode.textContent = hint;
+      hintNode.hidden = !(enabled && hint);
+    }
+  }
+
   function renderTodayGoal(goal) {
+    var card = byId('today-goal-card');
     var body = byId('today-goal-body');
     var empty = byId('today-goal-empty');
     var pctNode = byId('today-goal-pct');
     if (!body || !empty) { return; }
-    if (!goal || !goal.enabled) {
+    if (card) { card.setAttribute('data-tone', goalTone(goal)); }
+    renderGoalStatus(goal);
+
+    var editorOpen = goalEditorOpen();
+    var enabled = !!(goal && goal.enabled);
+    if (editorOpen) {
       body.hidden = true;
-      empty.hidden = false;
+      empty.hidden = true;
+    } else {
+      body.hidden = !enabled;
+      empty.hidden = enabled;
+    }
+
+    if (!enabled) {
       if (pctNode) { pctNode.textContent = '—'; }
       return;
     }
-    body.hidden = false;
-    empty.hidden = true;
+    if (editorOpen) { return; }
 
     var pct = clamp(int(goal.pct), 0, 100);
     byId('today-goal-value').textContent = fmtNumber(goal.goal_weight_kg, 1);
@@ -1002,6 +1093,287 @@
     } else {
       daysNode.textContent = 'дата не задана';
     }
+  }
+
+  function goalInputDate(goal, profile) {
+    if (goal && goal.goal_date) { return String(goal.goal_date).slice(0, 10); }
+    if (profile && profile.goal_date) { return String(profile.goal_date).slice(0, 10); }
+    return '';
+  }
+
+  function goalInputWeight(goal, profile) {
+    if (goal && goal.enabled && goal.goal_weight_kg != null) { return goal.goal_weight_kg; }
+    if (profile && profile.goal_weight_kg != null) { return profile.goal_weight_kg; }
+    return null;
+  }
+
+  function openGoalEditor(event) {
+    if (event && event.preventDefault) { event.preventDefault(); }
+    var editor = byId('today-goal-editor');
+    if (!editor) { return; }
+    var goal = (state.bootstrap && state.bootstrap.goal) || null;
+    var profile = currentProfile() || {};
+    var weight = byId('today-goal-input-weight');
+    var date = byId('today-goal-input-date');
+    var weightValue = goalInputWeight(goal, profile);
+    if (weight) {
+      weight.value = weightValue != null ? fmtNumber(weightValue, 1).replace(',', '.') : '';
+    }
+    if (date) { date.value = goalInputDate(goal, profile); }
+    var error = byId('today-goal-error');
+    if (error) {
+      error.textContent = '';
+      error.hidden = true;
+    }
+    goalEditorVisible(true, goal);
+    haptic('select');
+    try { editor.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (errorObj) { /* noop */ }
+    window.setTimeout(function () {
+      if (weight) { try { weight.focus(); } catch (errorObj) { /* noop */ } }
+    }, 60);
+  }
+
+  function closeGoalEditor() {
+    if (!goalEditorOpen()) { return; }
+    goalEditorVisible(false, state.bootstrap && state.bootstrap.goal);
+    renderTodayGoal(state.bootstrap && state.bootstrap.goal);
+  }
+
+  function showGoalEditorError(message) {
+    var error = byId('today-goal-error');
+    if (!error) { return; }
+    error.textContent = message;
+    error.hidden = false;
+  }
+
+  /* Локальная перерисовка карточки сразу после PUT — не ждём bootstrap.
+     Авторитетные pct/status придут со следующим /api/bootstrap. */
+  function applyGoalLocally(goalWeight, goalDate, profile) {
+    if (!state.bootstrap) { return; }
+    if (profile) { state.bootstrap.profile = profile; }
+    var previous = state.bootstrap.goal || {};
+    var enabled = goalWeight != null;
+    var next = {
+      enabled: enabled,
+      goal_weight_kg: goalWeight,
+      goal_date: goalDate,
+      status: previous.status || null
+    };
+    if (enabled) {
+      var start = previous.start_weight_kg != null
+        ? num(previous.start_weight_kg)
+        : num((profile || {}).weight_kg, goalWeight);
+      var current = previous.current_weight_kg != null
+        ? num(previous.current_weight_kg)
+        : num((profile || {}).weight_kg, start);
+      var direction = goalWeight >= current ? 'gain' : 'lose';
+      var total = Math.abs(goalWeight - start);
+      var done = Math.abs(current - start);
+      var reached = direction === 'gain' ? current >= goalWeight : current <= goalWeight;
+      next.start_weight_kg = start;
+      next.current_weight_kg = current;
+      next.direction = direction;
+      next.pct = total > 0 ? clamp(Math.round(done / total * 100), 0, 100) : 0;
+      next.kg_left = reached ? 0 : Math.abs(goalWeight - current);
+      next.kg_done = Math.abs(current - start);
+      next.reached = reached;
+      if (goalDate) {
+        var milliseconds = parseIso(goalDate).getTime() - parseIso(todayIso()).getTime();
+        next.days_left = Math.max(0, Math.ceil(milliseconds / 86400000));
+      } else {
+        next.days_left = null;
+      }
+      if (next.status && next.status.code === 'no_data' && next.current_weight_kg != null) {
+        next.status = null; /* новые данные — статус обновит bootstrap */
+      }
+    }
+    state.bootstrap.goal = next;
+    renderTodayGoal(next);
+  }
+
+  function submitGoalEditor(event) {
+    event.preventDefault();
+    var weightRaw = byId('today-goal-input-weight').value.trim();
+    var goalDate = byId('today-goal-input-date').value || '';
+    var goalWeight = weightRaw ? num(weightRaw) : null;
+    if (goalWeight != null && (goalWeight < 30 || goalWeight > 300)) {
+      showGoalEditorError('Цель по весу — от 30 до 300 кг');
+      toast('Цель по весу — от 30 до 300 кг', 'error');
+      haptic('error');
+      return;
+    }
+    if (goalWeight == null && goalDate) {
+      showGoalEditorError('Сначала укажи цель по весу');
+      toast('Сначала укажи цель по весу', 'error');
+      haptic('error');
+      return;
+    }
+    var payload = {
+      goal_weight_kg: goalWeight,
+      goal_date: goalWeight != null && goalDate ? goalDate : null
+    };
+    var error = byId('today-goal-error');
+    if (error) {
+      error.textContent = '';
+      error.hidden = true;
+    }
+    var button = byId('today-goal-save');
+    setBusy(button, true);
+    apiRequest('PUT', '/api/profile', payload).then(function (data) {
+      setBusy(button, false);
+      haptic('success');
+      var profile = (data && data.profile) || null;
+      goalEditorVisible(false, null);
+      applyGoalLocally(payload.goal_weight_kg, payload.goal_date, profile);
+      if (payload.goal_weight_kg == null) {
+        toast('Цель по весу убрана');
+      } else {
+        toast('Цель сохранена: ' + fmtNumber(payload.goal_weight_kg, 1) + ' кг');
+      }
+      loadBootstrap({ force: true });
+    }).catch(function (errorObj) {
+      setBusy(button, false);
+      haptic('error');
+      showGoalEditorError(errorText(errorObj.code));
+      toast(errorText(errorObj.code), 'error'); /* поля не сбрасываем */
+    });
+  }
+
+  /* ---------- обязательный недельный чек-ин ---------- */
+
+  function weeklyFeeling() {
+    var checked = document.querySelector('input[name="weekly-feel"]:checked');
+    var value = checked ? String(checked.value) : 'ok';
+    return (value === 'good' || value === 'bad') ? value : 'ok';
+  }
+
+  function setWeeklyFeeling(value) {
+    var normalized = (value === 'good' || value === 'bad') ? value : 'ok';
+    qsa('input[name="weekly-feel"]').forEach(function (input) {
+      input.checked = input.value === normalized;
+    });
+  }
+
+  function renderWeeklyModal(weekly) {
+    var lastNode = byId('weekly-last');
+    if (lastNode) {
+      var last = weekly && weekly.last;
+      if (last) {
+        lastNode.hidden = false;
+        lastNode.textContent = 'Прошлый чек-ин: ' +
+          fmtNumber(last.weight_kg, 1) + ' кг · ' +
+          (last.week_start ? dateShort(last.week_start) : '—');
+      } else {
+        lastNode.hidden = true;
+        lastNode.textContent = '';
+      }
+    }
+    var weight = byId('weekly-weight');
+    if (weight) {
+      var current = weekly && weekly.current_weight_kg != null
+        ? num(weekly.current_weight_kg)
+        : num((currentProfile() || {}).weight_kg);
+      weight.value = current > 0 ? fmtNumber(current, 1).replace(',', '.') : '';
+    }
+    var recalc = byId('weekly-recalc');
+    if (recalc && recalc.checked !== true) { recalc.checked = true; }
+    setWeeklyFeeling('ok');
+    var error = byId('weekly-error');
+    if (error) {
+      error.textContent = '';
+      error.hidden = true;
+    }
+  }
+
+  function showWeeklyModal() {
+    var node = byId('weekly-modal');
+    if (!node) { return; }
+    state.weekly.shown = true;
+    node.hidden = false;
+    document.body.classList.add('modal-open');
+    window.setTimeout(function () {
+      var input = byId('weekly-weight');
+      if (input) { try { input.focus(); } catch (error) { /* noop */ } }
+    }, 80);
+  }
+
+  function hideWeeklyModal() {
+    var node = byId('weekly-modal');
+    if (!node) { return; }
+    node.hidden = true;
+    document.body.classList.remove('modal-open');
+  }
+
+  function handleWeeklyDue(bootstrap) {
+    var weekly = bootstrap && bootstrap.weekly ? bootstrap.weekly : null;
+    if (!weekly || !weekly.due) {
+      if (state.weekly.shown && !state.weekly.busy) { hideWeeklyModal(); }
+      return;
+    }
+    if (state.weekly.shown) { return; }
+    renderWeeklyModal(weekly);
+    showWeeklyModal();
+  }
+
+  function showWeeklyError(message) {
+    var error = byId('weekly-error');
+    if (!error) { return; }
+    error.textContent = message;
+    error.hidden = false;
+  }
+
+  function submitWeekly(event) {
+    event.preventDefault();
+    if (state.weekly.busy) { return; }
+    var weightInput = byId('weekly-weight');
+    var weightRaw = weightInput ? weightInput.value.trim() : '';
+    var weight = weightRaw ? num(weightRaw) : 0;
+    if (!weightRaw || weight < 30 || weight > 300) {
+      showWeeklyError('Укажи вес от 30 до 300 кг');
+      toast('Вес — от 30 до 300 кг', 'error');
+      haptic('error');
+      if (weightInput) { weightInput.focus(); }
+      return;
+    }
+    var recalc = byId('weekly-recalc');
+    var payload = {
+      weight_kg: weight,
+      feeling: weeklyFeeling(),
+      note: byId('weekly-note') ? byId('weekly-note').value.trim() : '',
+      recalc: !!(recalc && recalc.checked)
+    };
+    var button = byId('weekly-save');
+    state.weekly.busy = true;
+    setBusy(button, true);
+    apiRequest('POST', '/api/weekly', payload).then(function (data) {
+      state.weekly.busy = false;
+      state.weekly.saved = true;
+      setBusy(button, false);
+      haptic('success');
+      if (state.bootstrap) {
+        if (data && data.profile) { state.bootstrap.profile = data.profile; }
+        if (data && data.targets) { state.bootstrap.targets = data.targets; }
+        if (data && data.goal) {
+          state.bootstrap.goal = data.goal;
+          renderTodayGoal(data.goal);
+        }
+      }
+      hideWeeklyModal();
+      var targets = data && data.targets;
+      if (payload.recalc && targets && num(targets.kcal) > 0) {
+        toast('КБЖУ пересчитаны: ' + fmtInt(targets.kcal) + ' ккал / белок ' +
+          fmtInt(targets.protein) + ' г');
+      } else {
+        toast('Прогресс сохранён');
+      }
+      loadBootstrap({ force: true });
+    }).catch(function (errorObj) {
+      state.weekly.busy = false;
+      setBusy(button, false);
+      haptic('error');
+      showWeeklyError(errorText(errorObj.code));
+      toast(errorText(errorObj.code), 'error'); /* модалка остаётся, поля не теряем */
+    });
   }
 
   function isDayDone(item) {
@@ -1186,6 +1558,7 @@
       var macros = 'Б ' + fmtNumber(meal.protein, 1) +
         ' · Ж ' + fmtNumber(meal.fat, 1) +
         ' · У ' + fmtNumber(meal.carbs, 1) + ' г';
+      var ingredients = mealIngredientsText(meal);
       return '<li class="meal-item">' +
         '<div class="meal-item__main">' +
           '<div class="meal-item__head">' +
@@ -1193,6 +1566,7 @@
             '<span class="meal-item__title">' + esc(meal.title || 'Приём пищи') + '</span>' +
             '<span class="meal-item__kcal">' + esc(amount) + '</span>' +
           '</div>' +
+          (ingredients ? '<p class="meal-item__ingredients">' + ingredients + '</p>' : '') +
           '<p class="meal-item__macros">' + macros + '</p>' +
           note +
         '</div>' +
@@ -1202,9 +1576,21 @@
     }).join('');
   }
 
-  /* ======================= еда: автоКБЖУ, подсказки, граммы ======================= */
+  /* Компактный перечень ингредиентов приёма: «куриная грудка 200 г · яйцо 100 г». */
+  function mealIngredientsText(meal) {
+    var items = meal && Array.isArray(meal.items) ? meal.items : [];
+    var parts = [];
+    items.forEach(function (item) {
+      if (!item || typeof item !== 'object') { return; }
+      var title = String(item.title || '').trim();
+      if (!title) { return; }
+      var portion = num(item.grams) > 0 ? ' ' + fmtNumber(item.grams, 0) + ' г' : '';
+      parts.push(esc(title + portion));
+    });
+    return parts.length >= 2 ? parts.join(' · ') : '';
+  }
 
-  var foodSearchSeq = 0;
+  /* ======================= еда: мультиингредиенты, подсказки, граммы ======================= */
 
   function renderPresets() {
     var box = byId('meal-presets');
@@ -1225,56 +1611,134 @@
     };
   }
 
-  function currentGrams() {
-    var input = byId('meal-grams');
-    return clamp(int(input ? input.value : 100, 100), 1, 3000);
+  /* ---------- строки ингредиентов ---------- */
+
+  function newMealItem(preset) {
+    state.food.rowSeq = (state.food.rowSeq || 0) + 1;
+    return {
+      key: 'meal-row-' + state.food.rowSeq,
+      title: preset && preset.title ? String(preset.title) : '',
+      grams: preset && num(preset.grams, 0) > 0 ? clamp(int(preset.grams, 100), 1, 3000) : 100,
+      food: null,
+      suggest: { items: [], active: -1, loading: false, timer: null, seq: 0 }
+    };
   }
 
-  function updateMealPreview() {
-    var preview = byId('meal-preview');
-    if (!preview) { return; }
-    if (state.food.manual) {
-      preview.hidden = true;
-      return;
+  function mealItemByKey(key) {
+    var found = null;
+    (state.food.items || []).forEach(function (item) {
+      if (String(item.key) === String(key)) { found = item; }
+    });
+    return found;
+  }
+
+  function mealItemRow(item) {
+    return document.querySelector('[data-meal-row="' + String(item.key) + '"]');
+  }
+
+  function mealRowPreviewText(item) {
+    if (!item.food) {
+      return 'Выбери продукт из подсказок — КБЖУ посчитается сам';
     }
-    preview.hidden = false;
-    var food = state.food.selected;
-    if (!food) {
-      preview.textContent = 'Выбери продукт из подсказок — КБЖУ посчитается сам';
-      return;
-    }
-    var grams = currentGrams();
-    var macros = mealMacros(food, grams);
-    preview.textContent = '≈ ' + fmtInt(macros.kcal) + ' ккал · Б ' + fmtNumber(macros.protein, 1) +
+    var macros = mealMacros(item.food, item.grams);
+    return '≈ ' + fmtInt(macros.kcal) + ' ккал · Б ' + fmtNumber(macros.protein, 1) +
       ' · Ж ' + fmtNumber(macros.fat, 1) + ' · У ' + fmtNumber(macros.carbs, 1);
   }
 
-  function syncSelectedFood() {
-    var box = byId('food-selected');
+  function mealRowPer100Text(item) {
+    if (!item.food) { return ''; }
+    return 'на 100 г: ' + fmtInt(item.food.kcal) + ' ккал · Б ' + fmtNumber(item.food.protein, 1) +
+      ' · Ж ' + fmtNumber(item.food.fat, 1) + ' · У ' + fmtNumber(item.food.carbs, 1);
+  }
+
+  function mealRowHtml(item, index) {
+    var removable = (state.food.items || []).length > 1;
+    var removeButton = removable
+      ? '<button type="button" class="meal-item__remove" data-meal-row-remove="' + esc(item.key) + '" ' +
+          'aria-label="Удалить ингредиент ' + (index + 1) + '">×</button>'
+      : '';
+    return '<div class="meal-item-row" data-meal-row="' + esc(item.key) + '">' +
+      '<div class="meal-item-row__head">' +
+        '<input class="meal-item__title" type="text" maxlength="120" value="' + esc(item.title) + '" ' +
+          'placeholder="Продукт" autocomplete="off" role="combobox" aria-autocomplete="list" ' +
+          'aria-expanded="false" data-meal-title="' + esc(item.key) + '" ' +
+          'aria-label="Продукт, ингредиент ' + (index + 1) + '">' +
+        '<input class="meal-item__grams" type="number" inputmode="numeric" min="5" max="3000" step="10" ' +
+          'value="' + esc(String(item.grams)) + '" placeholder="г" data-meal-grams="' + esc(item.key) + '" ' +
+          'aria-label="Граммы, ингредиент ' + (index + 1) + '">' +
+        removeButton +
+      '</div>' +
+      '<div class="food-suggest meal-item__suggest" data-meal-suggest="' + esc(item.key) + '" hidden></div>' +
+      '<p class="meal-item__per100" data-meal-per100="' + esc(item.key) + '"' +
+        (item.food ? '' : ' hidden') + '>' + esc(mealRowPer100Text(item)) + '</p>' +
+      '<p class="meal-preview meal-item__preview" data-meal-preview="' + esc(item.key) + '">' +
+        esc(mealRowPreviewText(item)) + '</p>' +
+    '</div>';
+  }
+
+  function renderMealItems() {
+    var box = byId('meal-items');
     if (!box) { return; }
-    var food = state.food.selected;
-    if (!food || state.food.manual) {
-      box.hidden = true;
-      return;
+    if (!state.food.items.length) { state.food.items.push(newMealItem(null)); }
+    box.innerHTML = state.food.items.map(mealRowHtml).join('');
+    updateMealTotal();
+  }
+
+  function updateMealRow(item) {
+    var row = mealItemRow(item);
+    if (!row) { return; }
+    var preview = row.querySelector('[data-meal-preview]');
+    if (preview) { preview.textContent = mealRowPreviewText(item); }
+    var per100 = row.querySelector('[data-meal-per100]');
+    if (per100) {
+      per100.textContent = mealRowPer100Text(item);
+      per100.hidden = !item.food;
     }
-    box.hidden = false;
-    byId('food-selected-name').textContent = food.name || '—';
-    byId('food-selected-per100').textContent = 'на 100 г: ' +
-      fmtInt(food.kcal) + ' ккал · Б ' + fmtNumber(food.protein, 1) +
-      ' · Ж ' + fmtNumber(food.fat, 1) + ' · У ' + fmtNumber(food.carbs, 1);
   }
 
-  function setSelectedFood(food) {
-    state.food.selected = food || null;
-    syncSelectedFood();
-    updateMealPreview();
+  function updateMealTotal() {
+    var node = byId('meal-total');
+    if (!node) { return; }
+    var totals = { kcal: 0, protein: 0, fat: 0, carbs: 0 };
+    (state.food.items || []).forEach(function (item) {
+      if (!item.food) { return; }
+      var macros = mealMacros(item.food, item.grams);
+      totals.kcal += macros.kcal;
+      totals.protein += macros.protein;
+      totals.fat += macros.fat;
+      totals.carbs += macros.carbs;
+    });
+    node.textContent = 'Итого: ' + fmtInt(totals.kcal) + ' ккал · Б ' + fmtNumber(totals.protein, 1) +
+      ' · Ж ' + fmtNumber(totals.fat, 1) + ' · У ' + fmtNumber(totals.carbs, 1);
   }
 
-  function renderFoodSuggest() {
-    var box = byId('food-suggest');
+  function markMealRowsInvalid(items) {
+    var keys = {};
+    (items || []).forEach(function (item) { keys[item.key] = true; });
+    qsa('[data-meal-row]').forEach(function (row) {
+      row.classList.toggle('is-invalid', !!keys[row.getAttribute('data-meal-row')]);
+    });
+  }
+
+  /* ---------- live-подсказки в строке ---------- */
+
+  function hideMealSuggestions(exceptKey) {
+    qsa('[data-meal-suggest]').forEach(function (box) {
+      if (exceptKey && String(box.getAttribute('data-meal-suggest')) === String(exceptKey)) { return; }
+      box.hidden = true;
+      box.innerHTML = '';
+    });
+    qsa('.meal-item__title').forEach(function (input) {
+      if (exceptKey && String(input.getAttribute('data-meal-title')) === String(exceptKey)) { return; }
+      input.setAttribute('aria-expanded', 'false');
+    });
+  }
+
+  function renderRowSuggestions(item) {
+    var box = document.querySelector('[data-meal-suggest="' + String(item.key) + '"]');
+    var input = document.querySelector('[data-meal-title="' + String(item.key) + '"]');
     if (!box) { return; }
-    var items = state.food.search.items;
-    var input = byId('meal-title');
+    var items = (item.suggest && item.suggest.items) || [];
     if (!items.length) {
       box.hidden = true;
       box.innerHTML = '';
@@ -1284,170 +1748,265 @@
     box.hidden = false;
     if (input) { input.setAttribute('aria-expanded', 'true'); }
     box.innerHTML = items.map(function (food, index) {
-      var active = index === state.food.search.active;
+      var active = index === item.suggest.active;
       return '<button type="button" class="food-suggest__item' + (active ? ' is-active' : '') + '" ' +
-        'role="option" data-food-id="' + esc(food.id) + '" aria-selected="' + (active ? 'true' : 'false') + '">' +
+        'role="option" data-food-id="' + esc(food.id) + '" data-row-key="' + esc(item.key) + '" ' +
+        'aria-selected="' + (active ? 'true' : 'false') + '">' +
         '<span class="food-suggest__name">' + esc(food.name) + '</span>' +
         '<span class="food-suggest__kcal">' + fmtInt(food.kcal) + ' ккал / 100 г</span>' +
       '</button>';
     }).join('');
   }
 
-  function requestFoodSuggestions(query) {
-    var seq = ++foodSearchSeq;
-    state.food.search.loading = true;
+  function requestRowSuggestions(item, query) {
+    var seq = ++item.suggest.seq;
+    item.suggest.loading = true;
     apiRequest('GET', '/api/foods?q=' + encodeURIComponent(query) + '&limit=8').then(function (data) {
-      if (seq !== foodSearchSeq) { return; }
-      state.food.search.loading = false;
-      state.food.search.items = ((data && data.items) || []).slice(0, 8);
-      state.food.search.active = -1;
-      renderFoodSuggest();
+      if (seq !== item.suggest.seq) { return; }
+      item.suggest.loading = false;
+      item.suggest.items = ((data && data.items) || []).slice(0, 8);
+      item.suggest.active = -1;
+      renderRowSuggestions(item);
     }).catch(function () {
-      if (seq !== foodSearchSeq) { return; }
-      state.food.search.loading = false;
-      state.food.search.items = [];
-      renderFoodSuggest(); /* API v2 может быть не готов — не мешаем ручному вводу */
+      if (seq !== item.suggest.seq) { return; }
+      item.suggest.loading = false;
+      item.suggest.items = [];
+      renderRowSuggestions(item); /* API может быть ещё не готов — не мешаем вводу */
     });
   }
 
-  function scheduleFoodSearch(query) {
-    var search = state.food.search;
-    if (search.timer) { window.clearTimeout(search.timer); search.timer = null; }
-    search.query = query;
+  function scheduleRowSearch(item, query) {
+    var suggest = item.suggest;
+    if (suggest.timer) { window.clearTimeout(suggest.timer); suggest.timer = null; }
     if (!query) {
-      search.items = [];
-      renderFoodSuggest();
+      suggest.items = [];
+      renderRowSuggestions(item);
       return;
     }
-    search.timer = window.setTimeout(function () {
-      search.timer = null;
-      requestFoodSuggestions(query);
+    suggest.timer = window.setTimeout(function () {
+      suggest.timer = null;
+      requestRowSuggestions(item, query);
     }, 200);
   }
 
-  function findSuggestFood(foodId) {
-    var found = null;
-    state.food.search.items.forEach(function (item) {
-      if (String(item.id) === String(foodId)) { found = item; }
-    });
-    return found;
-  }
-
-  function selectFoodById(foodId) {
-    var food = findSuggestFood(foodId);
-    if (!food) { return; }
-    setSelectedFood(food);
-    byId('meal-title').value = food.name || '';
-    state.food.search.items = [];
-    state.food.search.query = food.name || '';
-    state.food.search.active = -1;
-    renderFoodSuggest();
-    clearMealFormError();
-    updateMealPreview();
-    haptic('select');
-  }
-
-  function onMealTitleInput() {
-    var value = byId('meal-title').value.trim();
-    var selected = state.food.selected;
-    if (selected && String(selected.name || '').toLowerCase() !== value.toLowerCase()) {
-      setSelectedFood(null);
+  function setRowFood(item, food) {
+    item.food = food || null;
+    item.suggest.seq += 1;
+    item.suggest.items = [];
+    item.suggest.active = -1;
+    if (food) {
+      item.title = food.name || item.title;
+      var input = document.querySelector('[data-meal-title="' + String(item.key) + '"]');
+      if (input) { input.value = item.title; }
     }
+    renderRowSuggestions(item);
+    updateMealRow(item);
+    updateMealTotal();
     clearMealFormError();
-    scheduleFoodSearch(value);
-    updateMealPreview();
   }
 
-  function onMealTitleFocus() {
-    if (byId('meal-title').value.trim()) {
-      if (state.food.search.items.length) { renderFoodSuggest(); }
+  /* ---------- обработчики строк ---------- */
+
+  function onMealItemsInput(event) {
+    var target = event.target;
+    if (!target || !target.closest) { return; }
+    var titleInput = target.closest('.meal-item__title');
+    if (titleInput) {
+      var item = mealItemByKey(titleInput.getAttribute('data-meal-title'));
+      if (!item) { return; }
+      item.title = titleInput.value;
+      if (item.food && String(item.food.name || '').toLowerCase() !== item.title.trim().toLowerCase()) {
+        item.food = null;
+        updateMealTotal();
+      }
+      var row = titleInput.closest('.meal-item-row');
+      if (row) { row.classList.remove('is-invalid'); }
+      clearMealFormError();
+      scheduleRowSearch(item, item.title.trim());
+      updateMealRow(item);
       return;
     }
-    if (!state.food.search.items.length) {
-      requestFoodSuggestions(''); /* пустой q — популярные продукты */
-    } else {
-      renderFoodSuggest();
+    var gramsInput = target.closest('.meal-item__grams');
+    if (gramsInput) {
+      var gramsItem = mealItemByKey(gramsInput.getAttribute('data-meal-grams'));
+      if (!gramsItem) { return; }
+      gramsItem.grams = clamp(int(gramsInput.value, 100), 1, 3000);
+      updateMealRow(gramsItem);
+      updateMealTotal();
     }
   }
 
-  function onMealTitleKeydown(event) {
-    var search = state.food.search;
+  function onMealItemsFocus(event) {
+    var target = event.target;
+    if (!target || !target.closest) { return; }
+    var input = target.closest('.meal-item__title');
+    if (!input) { return; }
+    var item = mealItemByKey(input.getAttribute('data-meal-title'));
+    if (!item) { return; }
+    hideMealSuggestions(item.key);
+    var query = input.value.trim();
+    if (!query && !(item.suggest.items || []).length) {
+      requestRowSuggestions(item, ''); /* пустой q — популярные продукты */
+      return;
+    }
+    if ((item.suggest.items || []).length) {
+      renderRowSuggestions(item);
+    }
+  }
+
+  function onMealItemsKeydown(event) {
+    var target = event.target;
+    if (!target || !target.closest) { return; }
+    var input = target.closest('.meal-item__title');
+    if (!input) { return; }
+    var item = mealItemByKey(input.getAttribute('data-meal-title'));
+    if (!item) { return; }
+    var suggest = item.suggest;
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-      if (!search.items.length) { return; }
+      if (!suggest.items.length) { return; }
       event.preventDefault();
       var delta = event.key === 'ArrowDown' ? 1 : -1;
-      search.active = search.active < 0
+      suggest.active = suggest.active < 0
         ? 0
-        : clamp(search.active + delta, 0, search.items.length - 1);
-      renderFoodSuggest();
+        : clamp(suggest.active + delta, 0, suggest.items.length - 1);
+      renderRowSuggestions(item);
       return;
     }
     if (event.key === 'Enter') {
-      if (search.items.length) {
+      if (suggest.items.length) {
         event.preventDefault();
-        var index = search.active >= 0 ? search.active : 0;
-        selectFoodById(search.items[index].id);
+        var index = suggest.active >= 0 ? suggest.active : 0;
+        setRowFood(item, suggest.items[index]);
+        haptic('select');
       }
       return;
     }
     if (event.key === 'Escape') {
-      search.items = [];
-      renderFoodSuggest();
+      suggest.items = [];
+      renderRowSuggestions(item);
     }
   }
 
-  var productMatchSeq = 0;
+  function onMealItemsClick(event) {
+    var target = event.target;
+    if (!target || !target.closest) { return; }
+    var removeButton = target.closest('[data-meal-row-remove]');
+    if (removeButton) {
+      removeMealItem(removeButton.getAttribute('data-meal-row-remove'));
+      return;
+    }
+    var foodButton = target.closest('[data-food-id]');
+    if (!foodButton) { return; }
+    var item = mealItemByKey(foodButton.getAttribute('data-row-key'));
+    if (!item) { return; }
+    var food = null;
+    (item.suggest.items || []).forEach(function (candidate) {
+      if (String(candidate.id) === String(foodButton.getAttribute('data-food-id'))) { food = candidate; }
+    });
+    if (!food) { return; }
+    setRowFood(item, food);
+    haptic('select');
+  }
+
+  function addMealItem(preset) {
+    if (state.food.manual) { toggleManualMode(); }
+    var item = null;
+    /* Пресет заполняет единственную пустую строку, если она ещё нетронута,
+       иначе добавляет новую — «пресеты добавляют строку» без пустых остатков. */
+    if (preset && state.food.items.length === 1) {
+      var candidate = state.food.items[0];
+      if (!String(candidate.title || '').trim() && !candidate.food && int(candidate.grams, 100) === 100) {
+        item = candidate;
+        item.title = String(preset.title);
+        item.grams = clamp(int(preset.grams, 100), 1, 3000);
+        item.suggest.items = [];
+        item.suggest.active = -1;
+      }
+    }
+    if (item) {
+      renderMealItems();
+    } else {
+      item = newMealItem(preset);
+      state.food.items.push(item);
+      renderMealItems();
+    }
+    clearMealFormError();
+    var input = document.querySelector('[data-meal-title="' + String(item.key) + '"]');
+    if (input) {
+      try { input.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (error) { /* noop */ }
+      try { input.focus(); } catch (error) { /* noop */ }
+    }
+    haptic('select');
+    if (preset && preset.title) {
+      /* Пресет сразу даёт продукт и граммы; точное имя/КБЖУ подтягиваем с сервера. */
+      var seq = ++item.suggest.seq;
+      apiRequest('GET', '/api/foods?q=' + encodeURIComponent(preset.title) + '&limit=1').then(function (data) {
+        if (seq !== item.suggest.seq) { return; }
+        var items = (data && data.items) || [];
+        if (items.length && !item.food) { setRowFood(item, items[0]); }
+      }).catch(function () { /* подсказки недоступны — отправим текст как есть */ });
+    }
+    return item;
+  }
+
+  function removeMealItem(key) {
+    if ((state.food.items || []).length <= 1) { return; }
+    state.food.items = state.food.items.filter(function (item) {
+      return String(item.key) !== String(key);
+    });
+    renderMealItems();
+    clearMealFormError();
+    haptic('select');
+  }
 
   function applyProductPreset(index) {
     var preset = PRODUCT_PRESETS[index];
     if (!preset) { return; }
-    if (state.food.manual) { toggleManualMode(); } /* пресет — всегда автоКБЖУ */
-    byId('meal-title').value = preset.title;
-    byId('meal-grams').value = String(preset.grams);
-    setSelectedFood(null);
-    state.food.search.items = [];
-    renderFoodSuggest();
-    updateMealPreview();
-    haptic('select');
-    byId('meal-grams').focus();
-    /* Подтягиваем точное имя и КБЖУ с сервера. */
-    var seq = ++productMatchSeq;
-    apiRequest('GET', '/api/foods?q=' + encodeURIComponent(preset.title) + '&limit=1').then(function (data) {
-      if (seq !== productMatchSeq) { return; }
-      var items = (data && data.items) || [];
-      if (items.length && !state.food.search.items.length) {
-        state.food.search.items = items;
-        selectFoodById(items[0].id);
-        byId('meal-title').value = preset.title;
-      }
-    }).catch(function () { /* подсказки недоступны — отправим текст как есть */ });
+    addMealItem(preset);
   }
 
-  function applyGramsStep(delta) {
-    var input = byId('meal-grams');
-    if (!input) { return; }
-    input.value = String(clamp(int(input.value, 100) + delta, 1, 3000));
-    haptic('select');
-    updateMealPreview();
+  function applyFoodSuggestion(foodId) {
+    var food = null;
+    (state.food.notFound || []).forEach(function (candidate) {
+      if (String(candidate.id) === String(foodId)) { food = candidate; }
+    });
+    if (!food) { return; }
+    var target = null;
+    (state.food.items || []).forEach(function (item) {
+      if (!target && !item.food) { target = item; }
+    });
+    if (!target) { target = addMealItem(null); }
+    setRowFood(target, food);
+    var box = byId('food-notfound-suggest');
+    if (box) {
+      box.hidden = true;
+      box.innerHTML = '';
+    }
+  }
+
+  function syncMealMode() {
+    var manual = state.food.manual;
+    var itemsBox = byId('meal-items');
+    var addButton = byId('meal-add-item');
+    var total = byId('meal-total');
+    if (itemsBox) { itemsBox.hidden = manual; }
+    if (addButton) { addButton.hidden = manual; }
+    if (total) { total.hidden = manual; }
+    var manualBox = byId('meal-manual');
+    if (manualBox) { manualBox.hidden = !manual; }
+    var submit = byId('meal-submit');
+    if (submit) { submit.textContent = manual ? 'Добавить вручную' : 'Добавить'; }
+    var toggle = byId('btn-meal-manual');
+    if (toggle) {
+      toggle.setAttribute('aria-expanded', manual ? 'true' : 'false');
+      toggle.textContent = manual ? 'вернуться к автоКБЖУ' : 'ввести вручную';
+    }
+    if (manual) { hideMealSuggestions(); }
   }
 
   function toggleManualMode() {
     state.food.manual = !state.food.manual;
-    var manual = state.food.manual;
-    byId('meal-manual').hidden = !manual;
-    byId('meal-grams-field').hidden = manual;
-    byId('meal-submit').textContent = manual ? 'Добавить вручную' : 'Добавить';
-    var toggle = byId('btn-meal-manual');
-    toggle.setAttribute('aria-expanded', manual ? 'true' : 'false');
-    toggle.textContent = manual ? 'вернуться к автоКБЖУ' : 'ввести вручную';
-    if (manual) {
-      byId('meal-preview').hidden = true;
-      byId('food-selected').hidden = true;
-      byId('food-suggest').hidden = true;
-    } else {
-      syncSelectedFood();
-      updateMealPreview();
-    }
+    syncMealMode();
     clearMealFormError();
     haptic('select');
   }
@@ -1475,7 +2034,7 @@
   function showFoodNotFound(query) {
     var error = byId('meal-form-error');
     if (error) {
-      error.textContent = 'Не нашёл продукт «' + query + '» — уточни название или введи КБЖУ вручную.';
+      error.textContent = 'Не нашёл продукт «' + query + '» — уточни название.';
       error.hidden = false;
     }
     var box = byId('food-notfound-suggest');
@@ -1485,7 +2044,7 @@
     apiRequest('GET', '/api/foods?q=' + encodeURIComponent(query) + '&limit=3').then(function (data) {
       var items = (data && data.items) || [];
       if (!items.length) { return; }
-      state.food.search.items = items.slice();
+      state.food.notFound = items.slice();
       box.innerHTML = items.map(function (food) {
         return '<button type="button" class="preset" data-suggest-food="' + esc(food.id) + '">' +
           esc(food.name) + ' · ' + fmtInt(food.kcal) + ' ккал</button>';
@@ -1499,10 +2058,14 @@
     form.hidden = false;
     byId('btn-open-meal-form').hidden = true;
     if (!byId('meal-time').value) { byId('meal-time').value = nowHm(); }
-    if (!byId('meal-grams').value) { byId('meal-grams').value = '100'; }
-    updateMealPreview();
+    if (!state.food.items.length) { state.food.items.push(newMealItem(null)); }
+    renderMealItems();
+    syncMealMode();
     try { form.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (error) { /* noop */ }
-    window.setTimeout(function () { byId('meal-title').focus(); }, 60);
+    window.setTimeout(function () {
+      var input = document.querySelector('.meal-item__title');
+      if (input) { try { input.focus(); } catch (error) { /* noop */ } }
+    }, 60);
   }
 
   function closeMealForm() {
@@ -1511,34 +2074,35 @@
   }
 
   function resetMealForm() {
+    state.food.items = [newMealItem(null)];
+    state.food.notFound = [];
+    state.food.manual = false;
     byId('meal-title').value = '';
-    byId('meal-grams').value = '100';
     byId('meal-kcal').value = '';
     byId('meal-protein').value = '';
     byId('meal-fat').value = '';
     byId('meal-carbs').value = '';
     byId('meal-note').value = '';
     byId('meal-time').value = nowHm();
-    state.food.search.items = [];
-    state.food.search.query = '';
-    state.food.search.active = -1;
-    setSelectedFood(null);
-    renderFoodSuggest();
-    if (state.food.manual) { toggleManualMode(); }
+    renderMealItems();
+    syncMealMode();
     clearMealFormError();
-    updateMealPreview();
   }
 
   function submitMeal(event) {
     event.preventDefault();
-    var title = byId('meal-title').value.trim();
-    if (!title) {
-      toast('Что съел? Добавь название продукта', 'error');
-      byId('meal-title').focus();
-      return;
-    }
+    var timeValue = byId('meal-time').value || nowHm();
+    var note = byId('meal-note').value.trim();
     var payload;
+    var successText;
+
     if (state.food.manual) {
+      var title = byId('meal-title').value.trim();
+      if (!title) {
+        toast('Что съел? Добавь название продукта', 'error');
+        byId('meal-title').focus();
+        return;
+      }
       var kcal = num(byId('meal-kcal').value);
       if (kcal <= 0) {
         toast('Укажи калорийность вручную', 'error');
@@ -1547,32 +2111,51 @@
       }
       payload = {
         date: state.food.date,
-        time: byId('meal-time').value || nowHm(),
+        time: timeValue,
         title: title,
         kcal: kcal,
         protein: num(byId('meal-protein').value),
         fat: num(byId('meal-fat').value),
         carbs: num(byId('meal-carbs').value),
-        note: byId('meal-note').value.trim()
+        note: note
       };
+      successText = 'Записано: ' + title;
     } else {
-      payload = {
-        date: state.food.date,
-        time: byId('meal-time').value || nowHm(),
-        title: state.food.selected ? state.food.selected.name : title,
-        grams: currentGrams(),
-        note: byId('meal-note').value.trim()
-      };
-      if (state.food.selected) { payload.food_id = state.food.selected.id; }
+      var items = [];
+      (state.food.items || []).forEach(function (item) {
+        var itemTitle = String(item.title || '').trim();
+        if (!itemTitle) { return; } /* пустые строки не отправляем */
+        var portion = { grams: clamp(int(item.grams, 100), 1, 3000) };
+        if (item.food && item.food.id != null) {
+          portion.food_id = item.food.id;
+        } else {
+          portion.title = itemTitle;
+        }
+        items.push(portion);
+      });
+      if (!items.length) {
+        markMealRowsInvalid(state.food.items);
+        toast('Выбери продукт во всех строках', 'error');
+        haptic('error');
+        return;
+      }
+      markMealRowsInvalid([]);
+      payload = { date: state.food.date, time: timeValue, note: note, items: items };
+      successText = 'Записано: ' + items.length + ' ' +
+        plural(items.length, 'ингредиент', 'ингредиента', 'ингредиентов');
     }
-    var gramsLabel = state.food.manual ? '' : ' · ' + currentGrams() + ' г';
+
     clearMealFormError();
     var button = byId('meal-submit');
     setBusy(button, true);
-    apiRequest('POST', '/api/meals', payload).then(function () {
+    apiRequest('POST', '/api/meals', payload).then(function (data) {
       setBusy(button, false);
       haptic('success');
-      toast('Записано: ' + title + gramsLabel);
+      var meal = data && data.meal;
+      if (!state.food.manual && meal && num(meal.kcal) > 0) {
+        successText += ' · ' + fmtInt(meal.kcal) + ' ккал';
+      }
+      toast(successText);
       resetMealForm();
       closeMealForm();
       state.food.data = null;
@@ -1582,9 +2165,14 @@
       setBusy(button, false);
       haptic('error');
       if (error.code === 'food_not_found') {
-        showFoodNotFound(title);
-        requestFoodSuggestions(title);
-        return; /* поле не очищаем — пусть пользователь уточнит */
+        var missing = [];
+        (state.food.items || []).forEach(function (item) {
+          if (String(item.title || '').trim() && !item.food) { missing.push(item); }
+        });
+        markMealRowsInvalid(missing);
+        showMealFormError('Не нашёл один из ингредиентов — уточни название.');
+        if (missing.length) { showFoodNotFound(String(missing[0].title || '').trim()); }
+        return; /* строки не очищаем — пусть пользователь уточнит */
       }
       if (error.code === 'bad_request') {
         showMealFormError(errorText(error.code));
@@ -2644,9 +3232,27 @@
     renderProfileSummary();
   }
 
+  /* Светлый трек range: --range-fill задаёт accent-заливку в styles.css. */
+  function syncRangeFill(input) {
+    if (!input) { return; }
+    var min = num(input.min, 0);
+    var max = num(input.max, 100);
+    var value = num(input.value, min);
+    var percent = max > min ? ((value - min) / (max - min)) * 100 : 0;
+    input.style.setProperty('--range-fill', clamp(percent, 0, 100).toFixed(2) + '%');
+  }
+
+  function syncRangeFills() {
+    syncRangeFill(byId('onb-rate'));
+    syncRangeFill(byId('prof-rate'));
+  }
+
   function updateRateLabel(inputId, labelId) {
-    var value = num(byId(inputId).value, 0.35);
+    var input = byId(inputId);
+    if (!input || !byId(labelId)) { return; }
+    var value = num(input.value, 0.35);
     byId(labelId).textContent = fmtNumber(value, 2) + ' кг/нед';
+    syncRangeFill(input);
   }
 
   function submitWeight(event) {
@@ -2667,7 +3273,7 @@
       byId('weight-kg').value = '';
       state.progress.weights = null;
       loadProgress({ silent: true });
-      loadBootstrap();
+      loadBootstrap({ force: true }); /* тренд веса меняет goal.status */
     }).catch(function (error) {
       setBusy(button, false);
       haptic('error');
@@ -2716,10 +3322,14 @@
       setBusy(button, false);
       haptic('success');
       var targets = (data && data.targets) || null;
+      var profile = (data && data.profile) || (state.bootstrap && state.bootstrap.profile) || null;
       if (state.bootstrap) {
-        state.bootstrap.profile = (data && data.profile) || state.bootstrap.profile;
+        state.bootstrap.profile = profile || state.bootstrap.profile;
         if (targets) { state.bootstrap.targets = targets; }
       }
+      /* Цель могла измениться в профиле — карточка «Цель» обновляется сразу,
+         bootstrap принесёт авторитетные pct/status (loadBootstrap force). */
+      if (state.bootstrap) { applyGoalLocally(goalWeight, goalDate, profile); }
       renderProfileForm();
       renderToday();
       if (targets && targets.kcal) {
@@ -2727,7 +3337,7 @@
       } else {
         toast('Профиль сохранён');
       }
-      loadBootstrap();
+      loadBootstrap({ force: true });
     }).catch(function (error) {
       setBusy(button, false);
       haptic('error');
@@ -2935,15 +3545,7 @@
     }
     var suggest = target.closest('[data-suggest-food]');
     if (suggest) {
-      selectFoodById(suggest.getAttribute('data-suggest-food'));
-    }
-  }
-
-  function onFoodSuggestClick(event) {
-    var target = event.target;
-    var button = target && target.closest ? target.closest('[data-food-id]') : null;
-    if (button) {
-      selectFoodById(button.getAttribute('data-food-id'));
+      applyFoodSuggestion(suggest.getAttribute('data-suggest-food'));
     }
   }
 
@@ -3062,22 +3664,22 @@
       state.bootstrap = null;
       loadBootstrap();
     });
-    byId('btn-set-goal').addEventListener('click', function () {
-      switchTab('progress');
-      haptic('select');
-      window.setTimeout(function () {
-        var input = byId('prof-goal-weight');
-        if (!input) { return; }
-        try { input.focus(); } catch (error) { /* noop */ }
-      }, 320);
-    });
+    // Цель: inline-редактор прямо в карточке
+    byId('btn-set-goal').addEventListener('click', openGoalEditor);
+    byId('btn-edit-goal').addEventListener('click', openGoalEditor);
+    byId('today-goal-editor').addEventListener('submit', submitGoalEditor);
+    byId('today-goal-cancel').addEventListener('click', closeGoalEditor);
+    byId('today-day-list').addEventListener('click', onDayToggleClick);
+
+    // Обязательный недельный чек-ин (закрыть нельзя — только сохранить)
+    byId('weekly-form').addEventListener('submit', submitWeekly);
+
     byId('btn-day-plan').addEventListener('click', function () {
       state.schedule.segment = 'day';
       switchTab('schedule');
     });
-    byId('today-day-list').addEventListener('click', onDayToggleClick);
 
-    // Еда: автоКБЖУ + ручной режим
+    // Еда: мультиингредиенты + ручной режим
     byId('food-prev').addEventListener('click', function () { shiftFoodDate(-1); });
     byId('food-next').addEventListener('click', function () { shiftFoodDate(1); });
     byId('btn-open-meal-form').addEventListener('click', openMealForm);
@@ -3086,23 +3688,13 @@
     byId('food-list').addEventListener('click', onFoodListClick);
     byId('meal-presets').addEventListener('click', onPresetClick);
     byId('food-notfound-suggest').addEventListener('click', onPresetClick);
-    byId('food-suggest').addEventListener('click', onFoodSuggestClick);
-    byId('meal-title').addEventListener('input', onMealTitleInput);
-    byId('meal-title').addEventListener('focus', onMealTitleFocus);
-    byId('meal-title').addEventListener('keydown', onMealTitleKeydown);
-    byId('meal-grams').addEventListener('input', updateMealPreview);
-    byId('meal-grams').addEventListener('change', updateMealPreview);
-    byId('meal-grams-minus').addEventListener('click', function () { applyGramsStep(-10); });
-    byId('meal-grams-plus').addEventListener('click', function () { applyGramsStep(10); });
-    byId('food-selected-clear').addEventListener('click', function () {
-      setSelectedFood(null);
-      byId('meal-title').value = '';
-      clearMealFormError();
-      updateMealPreview();
-      haptic('select');
-    });
+    byId('meal-add-item').addEventListener('click', function () { addMealItem(null); });
+    byId('meal-items').addEventListener('input', onMealItemsInput);
+    byId('meal-items').addEventListener('focusin', onMealItemsFocus);
+    byId('meal-items').addEventListener('keydown', onMealItemsKeydown);
+    byId('meal-items').addEventListener('click', onMealItemsClick);
     byId('btn-meal-manual').addEventListener('click', toggleManualMode);
-    ['meal-kcal', 'meal-protein', 'meal-fat', 'meal-carbs'].forEach(function (id) {
+    ['meal-title', 'meal-kcal', 'meal-protein', 'meal-fat', 'meal-carbs'].forEach(function (id) {
       byId(id).addEventListener('input', clearMealFormError);
     });
 
@@ -3189,6 +3781,8 @@
     byId('meal-time').value = nowHm();
     setQuality(3);
     updateFoodDateUi();
+    resetMealForm(); /* одна пустая строка ингредиента + ручной режим выключен */
+    syncRangeFills();
     bindEvents();
     switchTab('today', { force: true });
     loadBootstrap(); // цели нужны любому экрану, даже если стартовая вкладка не «Сегодня»

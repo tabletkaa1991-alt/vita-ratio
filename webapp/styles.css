@@ -877,12 +877,75 @@ svg {
   color: var(--hint);
 }
 
+/* ---------- ползунок «Темп набора»: светлый трек (CONTRACT §16.1) ---------- */
+
 .field input[type="range"] {
-  min-height: 32px;
+  --range-fill: 0%;
+  width: 100%;
+  min-height: 44px;
+  height: 44px;
   padding: 0;
   border: none;
+  border-radius: 999px;
   background: transparent;
   accent-color: var(--accent);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+/* WebKit/Blink: базовый трек rgba(255,255,255,.26) + заливка accent до бегунка.
+   --range-fill выставляет app.js (syncRangeFill) при каждом изменении. */
+.field input[type="range"]::-webkit-slider-runnable-track {
+  width: 100%;
+  height: 8px;
+  border-radius: 999px;
+  background-color: rgba(255, 255, 255, 0.26);
+  background-image: linear-gradient(
+    90deg,
+    var(--accent) 0 var(--range-fill),
+    transparent var(--range-fill) 100%
+  );
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+.field input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 22px;
+  height: 22px;
+  margin-top: -7px; /* (8px трек − 22px бегунок) / 2 */
+  border-radius: 50%;
+  border: 2px solid #FFFFFF;
+  background: var(--accent);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45), 0 0 0 4px rgba(var(--accent-rgb), 0.18);
+}
+
+/* Firefox: светлый track + accent-заполнение + белый ободок у бегунка. */
+.field input[type="range"]::-moz-range-track {
+  height: 8px;
+  border-radius: 999px;
+  background-color: rgba(255, 255, 255, 0.26);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+.field input[type="range"]::-moz-range-progress {
+  height: 8px;
+  border-radius: 999px;
+  background-color: var(--accent);
+}
+
+.field input[type="range"]::-moz-range-thumb {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid #FFFFFF;
+  background: var(--accent);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45), 0 0 0 4px rgba(var(--accent-rgb), 0.18);
+}
+
+.field input[type="range"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
 }
 
 .field input[type="time"],
@@ -2448,5 +2511,296 @@ svg {
 
   .day-row__actions .mini-btn {
     padding: 3px 6px;
+  }
+}
+
+/* ==========================================================================
+   ВЕРСИЯ 3 — статус цели, inline-редактор, недельный чек-ин, мультиингредиенты
+   ========================================================================== */
+
+/* ---------- карточка «Цель»: статус, тон шкалы, inline-редактор ---------- */
+
+.goal-status {
+  margin-top: 8px;
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  overflow-wrap: anywhere;
+}
+
+.goal-status--good { color: var(--accent); }
+.goal-status--warn { color: var(--warn); }
+.goal-status--bad { color: var(--danger); }
+.goal-status--muted { color: var(--muted); }
+
+.goal-hint {
+  margin-top: 2px;
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--hint);
+  overflow-wrap: anywhere;
+}
+
+.goal-edit-btn {
+  margin-top: 10px;
+  min-height: 38px;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
+/* Тон шкалы цели из calc.goal_status: good / warn / bad / muted. */
+#today-goal-card[data-tone="good"] .goal-bar .bar__fill {
+  background: linear-gradient(90deg, #8FE388, var(--accent));
+}
+
+#today-goal-card[data-tone="warn"] .goal-bar .bar__fill {
+  background: linear-gradient(90deg, #E8B35F, var(--warn));
+}
+
+#today-goal-card[data-tone="bad"] .goal-bar .bar__fill {
+  background: linear-gradient(90deg, #E0654F, var(--danger));
+}
+
+#today-goal-card[data-tone="muted"] .goal-bar .bar__fill {
+  background: rgba(255, 255, 255, 0.38);
+}
+
+.goal-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 2px;
+}
+
+.goal-editor__title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+/* ---------- недельный чек-ин: обязательная модалка ---------- */
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 140;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  background: rgba(4, 7, 10, 0.74);
+  -webkit-backdrop-filter: blur(7px);
+  backdrop-filter: blur(7px);
+}
+
+.modal__panel {
+  width: 100%;
+  max-width: 420px;
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 18px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: linear-gradient(160deg, var(--card), var(--card-2));
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+}
+
+.modal__title {
+  margin-top: 2px;
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.weekly-modal__panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.weekly-form {
+  margin-top: 6px;
+  padding: 0;
+  gap: 12px;
+  background: none;
+  border: none;
+}
+
+.weekly-last {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 12.5px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+body.modal-open {
+  overflow: hidden;
+}
+
+/* три кнопки самочувствия */
+.segmented--3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.segmented--3 .segmented__item {
+  font-size: 13px;
+  padding: 0 4px;
+}
+
+/* ---------- форма приёма: мультиингредиенты ---------- */
+
+.meal-items {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.meal-item-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  background: var(--card-2);
+}
+
+.meal-item-row.is-invalid {
+  border-color: rgba(255, 122, 107, 0.7);
+  box-shadow: 0 0 0 2px rgba(255, 122, 107, 0.16);
+}
+
+.meal-item-row__head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 78px 34px;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+
+.meal-item__title,
+.meal-item__grams {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 42px;
+  padding: 9px 10px;
+  border-radius: 11px;
+  border: 1px solid var(--border-soft);
+  background: rgba(0, 0, 0, 0.24);
+  color: var(--text);
+  font-size: 16px; /* 16px = без авто-зума на iOS */
+  outline: none;
+  transition: border-color 0.18s, box-shadow 0.18s;
+}
+
+.meal-item__title::placeholder,
+.meal-item__grams::placeholder {
+  color: var(--hint);
+}
+
+.meal-item__title:focus,
+.meal-item__grams:focus {
+  border-color: rgba(var(--accent-rgb), 0.55);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.meal-item__grams {
+  text-align: center;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.meal-item__remove {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--hint);
+  font-size: 18px;
+  line-height: 1;
+}
+
+.meal-item__remove:hover {
+  color: var(--danger);
+  border-color: rgba(255, 122, 107, 0.3);
+  background: rgba(255, 122, 107, 0.08);
+}
+
+.meal-item__remove:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.meal-item__per100 {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.meal-item-row .food-suggest {
+  max-height: 200px;
+  margin-top: 0;
+}
+
+.meal-item-row .meal-preview {
+  padding: 7px 9px;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.meal-add-item {
+  min-height: 40px;
+  font-size: 13px;
+}
+
+.meal-total {
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px dashed var(--border);
+  background: rgba(var(--accent-rgb), 0.07);
+  color: var(--accent);
+  font-size: 13.5px;
+  font-weight: 700;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* перечень ингредиентов в списке приёмов */
+.meal-item__ingredients {
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--hint);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 359px) {
+  .meal-item-row__head {
+    grid-template-columns: minmax(0, 1fr) 68px 32px;
+    gap: 5px;
+  }
+
+  .meal-item__remove {
+    width: 32px;
+    height: 32px;
+  }
+
+  .meal-item-row {
+    padding: 8px;
   }
 }

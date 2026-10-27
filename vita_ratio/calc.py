@@ -529,3 +529,118 @@ def day_summary(items: list[dict]) -> dict:
         "pct": int(round(done / total * 100)) if total else 0,
         "next": upcoming[0] if upcoming else None,
     }
+
+
+# --- статус цели и недельный чек-ин -------------------------------------------
+
+GOAL_STATUS_LABELS = {
+    "on_track": "Идёшь по плану",
+    "ahead": "Опережаешь план",
+    "behind": "Отстаёшь от плана",
+    "done": "Цель достигнута",
+    "no_data": "Нужны взвешивания",
+}
+
+GOAL_STATUS_TONES = {
+    "on_track": "good",
+    "ahead": "warn",
+    "behind": "bad",
+    "done": "good",
+    "no_data": "muted",
+}
+
+
+def goal_status(goal: dict, trend_kg_per_week: float | None, goal_rate: float = 0.35) -> dict:
+    """Оценка: идёт ли прогресс к цели тем темпом, который заявлен.
+
+    trend_kg_per_week — фактический тренд веса (кг/нед), goal_rate — целевой темп.
+    """
+    status = {
+        "code": "no_data",
+        "label": GOAL_STATUS_LABELS["no_data"],
+        "tone": GOAL_STATUS_TONES["no_data"],
+        "trend_kg_per_week": None,
+        "target_kg_per_week": None,
+        "hint": "Взвешивайся хотя бы раз в неделю, чтобы видеть динамику.",
+    }
+    if not goal or not goal.get("enabled"):
+        status["hint"] = "Поставь цель по весу в профиле."
+        return status
+    if goal.get("reached"):
+        status.update({
+            "code": "done",
+            "label": GOAL_STATUS_LABELS["done"],
+            "tone": GOAL_STATUS_TONES["done"],
+            "hint": "Можно ставить новую цель или перейти на поддержание веса.",
+        })
+        return status
+    if trend_kg_per_week is None:
+        return status
+
+    direction = 1.0 if goal.get("direction", "gain") == "gain" else -1.0
+    target = max(0.05, float(goal_rate or 0.35)) * direction
+    actual = float(trend_kg_per_week)
+    status["trend_kg_per_week"] = round(actual, 2)
+    status["target_kg_per_week"] = round(target, 2)
+
+    effective = actual * direction          # >0 — движемся в нужную сторону
+    wanted = abs(target)
+    if effective <= 0.02:
+        status.update({
+            "code": "behind",
+            "label": GOAL_STATUS_LABELS["behind"],
+            "tone": "bad",
+            "hint": "Вес стоит или идёт не туда: проверь калории и регулярность взвешиваний.",
+        })
+    elif effective < wanted * 0.6:
+        status.update({
+            "code": "behind",
+            "label": GOAL_STATUS_LABELS["behind"],
+            "tone": "bad",
+            "hint": "Темп ниже плана: добавь 150–200 ккал и не пропускай приёмы пищи.",
+        })
+    elif effective > wanted * 1.6:
+        status.update({
+            "code": "ahead",
+            "label": GOAL_STATUS_LABELS["ahead"],
+            "tone": "warn",
+            "hint": "Темп выше плана: следи, чтобы прирост был не только жировой.",
+        })
+    else:
+        status.update({
+            "code": "on_track",
+            "label": GOAL_STATUS_LABELS["on_track"],
+            "tone": "good",
+            "hint": "Продолжай в том же режиме — питание и сон совпадают с целью.",
+        })
+    return status
+
+
+def week_bounds(value: date | str | None = None) -> dict:
+    """Границы текущей ISO-недели (понедельник–воскресенье)."""
+    day = parse_date(value) if value else parse_date(local_today())
+    start = day - timedelta(days=day.weekday())
+    return {
+        "week_start": start.isoformat(),
+        "week_end": (start + timedelta(days=6)).isoformat(),
+        "day_of_week": day.weekday(),
+        "days_to_sunday": 6 - day.weekday(),
+    }
+
+
+def meal_items_totals(items: list[dict]) -> dict:
+    """Сумма КБЖУ и граммов по ингредиентам приёма пищи."""
+    totals = {"kcal": 0, "protein": 0.0, "fat": 0.0, "carbs": 0.0, "grams": 0.0}
+    for item in items or []:
+        totals["kcal"] += int(item.get("kcal") or 0)
+        totals["protein"] += float(item.get("protein") or 0)
+        totals["fat"] += float(item.get("fat") or 0)
+        totals["carbs"] += float(item.get("carbs") or 0)
+        totals["grams"] += float(item.get("grams") or 0)
+    return {
+        "kcal": int(totals["kcal"]),
+        "protein": round(totals["protein"], 1),
+        "fat": round(totals["fat"], 1),
+        "carbs": round(totals["carbs"], 1),
+        "grams": round(totals["grams"], 1),
+    }

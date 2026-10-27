@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS meals (
     carbs      REAL    NOT NULL DEFAULT 0,
     grams      REAL    NOT NULL DEFAULT 0,
     food_key   TEXT    NOT NULL DEFAULT '',
+    items_json TEXT    NOT NULL DEFAULT '[]',
     note       TEXT    NOT NULL DEFAULT '',
     created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
@@ -120,3 +121,15 @@ CREATE TABLE IF NOT EXISTS day_plans (
     created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_day_plans_user_date ON day_plans(user_id, date);
+
+-- Недельный чек-ин: раз в неделю пользователь вводит прогресс и КБЖУ пересчитывается
+CREATE TABLE IF NOT EXISTS weekly_checkins (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    week_start  TEXT    NOT NULL,              -- понедельник ISO
+    weight_kg   REAL    NOT NULL,
+    feeling     TEXT    NOT NULL DEFAULT 'ok'  CHECK (feeling IN ('good','ok','bad')),
+    note        TEXT    NOT NULL DEFAULT '',
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (user_id, week_start)
+);

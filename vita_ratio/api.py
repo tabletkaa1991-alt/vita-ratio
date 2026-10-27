@@ -336,6 +336,31 @@ def _targets_json(profile: dict | None) -> dict | None:
     return _targets_obj(profile).to_dict()
 
 
+def _meal_items_json(meal: dict | None) -> list[dict]:
+    """Ингредиенты приёма пищи для JSON (старые записи без items -> [])."""
+    if not meal:
+        return []
+    items = meal.get("items")
+    if items is None:
+        items = store.parse_items(meal.get("items_json"))
+    result: list[dict] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        result.append(
+            {
+                "food_key": str(item.get("food_key") or ""),
+                "title": str(item.get("title") or ""),
+                "grams": _number(item.get("grams")),
+                "kcal": _number(item.get("kcal")),
+                "protein": _number(item.get("protein")),
+                "fat": _number(item.get("fat")),
+                "carbs": _number(item.get("carbs")),
+            }
+        )
+    return result
+
+
 def _meal_json(meal: dict | None) -> dict | None:
     if not meal:
         return None
@@ -351,6 +376,7 @@ def _meal_json(meal: dict | None) -> dict | None:
         "grams": _number(meal.get("grams")),
         "food_key": meal.get("food_key") or "",
         "note": meal.get("note") or "",
+        "items": _meal_items_json(meal),
     }
 
 
@@ -455,18 +481,33 @@ def _day_plan_json(row: dict | None) -> dict | None:
     }
 
 
-def _goal_payload(conn, user_id: int, profile: dict | None, day: str) -> dict:
-    """Прогресс к цели по весу: стартовый/текущий вес из взвешиваний за 60 дней."""
+def _goal_payload(
+    conn,
+    user_id: int,
+    profile: dict | None,
+    day: str,
+    trend_kg_per_week: float | None = None,
+) -> dict:
+    """Прогресс к цели по весу + статус (calc.goal_status) по тренду веса."""
     if not profile:
-        return calc.goal_progress(None)
+        goal = calc.goal_progress(None)
+        goal["status"] = calc.goal_status(goal, None, 0.35)
+        return goal
     weights = store.goal_weights(conn, user_id, profile, days=60, date_to=day)
-    return calc.goal_progress(
+    goal = calc.goal_progress(
         profile.get("goal_weight_kg"),
         profile.get("goal_date"),
         weights["start_weight_kg"],
         weights["current_weight_kg"],
         today=day,
     )
+    goal_rate = profile.get("goal_rate")
+    goal["status"] = calc.goal_status(
+        goal,
+        trend_kg_per_week,
+        float(goal_rate) if goal_rate is not None else 0.35,
+    )
+    return goal
 
 
 def _day_payload(conn, user_id: int, profile: dict | None, day: str) -> dict:
@@ -593,6 +634,32 @@ def _week_payload(stats: dict) -> dict:
             for row in days
         ],
         "avg_kcal": avg_kcal,
+    }
+
+
+def _checkin_json(row: dict | None) -> dict | None:
+    """Недельный чек-ин -> JSON (None, если чек-ина нет)."""
+    if not row:
+        return None
+    return {
+        "id": int(row.get("id") or 0),
+        "week_start": row.get("week_start"),
+        "weight_kg": _number(row.get("weight_kg")),
+        "feeling": row.get("feeling") or "ok",
+        "note": row.get("note") or "",
+        "created_at": row.get("created_at"),
+    }
+
+
+def _weekly_payload(conn, user_id: int, profile: dict | None, day: str) -> dict:
+    """Недельный чек-ин: due = есть профиль и нет чек-ина за текущую ISO-неделю."""
+    bounds = calc.week_bounds(day)
+    checkin = store.get_weekly_checkin(conn, user_id, bounds["week_start"])
+    return {
+        "due": bool(profile) and checkin is None,
+        "week_start": bounds["week_start"],
+        "week_end": bounds["week_end"],
+        "last": _checkin_json(store.last_weekly_checkin(conn, user_id)),
     }
 
 
@@ -730,6 +797,40 @@ async def get_meals(request: web.Request) -> web.Response:
     return json_ok({"date": day, "meals": meals, "totals": _totals_json(conn, user["id"], day)})
 
 
+def _meal_items_value(payload: dict) -> list[dict] | None:
+    """Разбирает ``items[]`` (v3): food_id/title + grams -> КБЖУ порции по базе foods."""
+    raw = payload.get("items")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        raise _bad("Список ингредиентов «items» не может быть пустым")
+    portions: list[dict] = []
+    for index, entry in enumerate(raw, start=1):
+        if not isinstance(entry, dict):
+            raise _bad(f"Ингредиент №{index} должен быть объектом")
+        grams_raw = entry.get("grams")
+        grams = 100.0
+        if grams_raw is not None and str(grams_raw).strip() != "":
+            grams = _float_value(grams_raw, f"grams (ингредиент №{index})", 0, 5000)
+        food_id = str(entry.get("food_id") or "").strip()
+        if food_id:
+            food = foods.find_by_id(food_id)
+            if food is None:
+                raise ApiError(400, "food_not_found", f"Не нашёл: {food_id}")
+        else:
+            name = _text_value(
+                entry.get("title") or entry.get("name"),
+                f"title (ингредиент №{index})",
+                200,
+                required=True,
+            )
+            food = foods.best_match(name)
+            if food is None:
+                raise ApiError(400, "food_not_found", f"Не нашёл: {name}")
+        portions.append(foods.macros_for_grams(food, grams))
+    return portions
+
+
 async def post_meal(request: web.Request) -> web.Response:
     user = _user(request)
     settings = _settings(request)
@@ -743,6 +844,28 @@ async def post_meal(request: web.Request) -> web.Response:
     else:
         time_value = _time_value(payload.get("time"), "time")
     note = _text_value(payload.get("note"), "note", 500)
+
+    # v3: несколько ингредиентов за раз — КБЖУ считает база продуктов.
+    portions = _meal_items_value(payload)
+    if portions is not None:
+        totals = calc.meal_items_totals(portions)
+        title = " + ".join(portion["title"] for portion in portions)
+        meal = store.add_meal(
+            conn,
+            user["id"],
+            day,
+            time_value,
+            title,
+            kcal=totals["kcal"],
+            protein=totals["protein"],
+            fat=totals["fat"],
+            carbs=totals["carbs"],
+            note=note,
+            grams=totals["grams"],
+            food_key=portions[0]["food_key"] if len(portions) == 1 else "",
+            items=portions,
+        )
+        return json_ok({"meal": _meal_json(meal), "totals": _totals_json(conn, user["id"], day)})
 
     # Режим автоКБЖУ: указаны граммы и/или food_id — состав считает база продуктов.
     food_id = str(payload.get("food_id") or "").strip()
@@ -1026,6 +1149,66 @@ async def post_weight(request: web.Request) -> web.Response:
     )
 
 
+# --- недельный чек-ин -----------------------------------------------------------
+
+def _feeling_value(value) -> str:
+    feeling = str(value or "ok").strip().lower()
+    if feeling not in store.WEEKLY_FEELINGS:
+        raise ApiError(400, "invalid_feeling", "Самочувствие должно быть good, ok или bad")
+    return feeling
+
+
+async def get_weekly(request: web.Request) -> web.Response:
+    """Состояние недельного чек-ина: надо ли заполнять и когда был прошлый."""
+    user = _user(request)
+    settings = _settings(request)
+    conn = _conn(request)
+    day = _query_date(request, settings)
+    profile = store.get_profile(conn, user["id"])
+    payload = _weekly_payload(conn, user["id"], profile, day)
+    weights = store.goal_weights(conn, user["id"], profile, days=60, date_to=day)
+    payload["current_weight_kg"] = weights["current_weight_kg"]
+    payload["goal_rate"] = (
+        round(float(profile.get("goal_rate") or 0.35), 2) if profile else None
+    )
+    return json_ok(payload)
+
+
+async def post_weekly(request: web.Request) -> web.Response:
+    """Upsert чек-ина за текущую ISO-неделю + взвешивание на сегодня."""
+    user = _user(request)
+    settings = _settings(request)
+    conn = _conn(request)
+    payload = await _body(request)
+    if payload.get("weight_kg") is None or str(payload.get("weight_kg")).strip() == "":
+        raise _bad("Укажите вес в килограммах")
+    weight = _float_value(payload.get("weight_kg"), "weight_kg", 30, 300)
+    feeling = _feeling_value(payload.get("feeling"))
+    note = _text_value(payload.get("note"), "note", 500)
+    day = _date_value(payload.get("date"), "date") or calc.local_today(settings.timezone)
+    bounds = calc.week_bounds(day)
+
+    checkin = store.upsert_weekly_checkin(
+        conn, user["id"], bounds["week_start"], weight, feeling=feeling, note=note
+    )
+    store.add_weight(conn, user["id"], day, weight, note=note)
+
+    recalc = _bool_value(payload.get("recalc"), False)
+    profile = store.get_profile(conn, user["id"])
+    if profile and recalc:
+        profile = store.upsert_profile(conn, user["id"], {"weight_kg": weight})
+
+    trend = store.weight_trend(conn, user["id"], days=14, date_to=day)
+    return json_ok(
+        {
+            "checkin": _checkin_json(checkin),
+            "profile": _profile_json(profile),
+            "targets": _targets_json(profile),
+            "goal": _goal_payload(conn, user["id"], profile, day, trend),
+        }
+    )
+
+
 # --- занятия -------------------------------------------------------------------
 
 def _class_create_payload(payload: dict) -> dict:
@@ -1239,8 +1422,11 @@ async def get_bootstrap(request: web.Request) -> web.Response:
         "user": _user_json(user),
         "profile": None,
         "targets": None,
-        "goal": _goal_payload(conn, user["id"], profile, day),
+        "goal": _goal_payload(
+            conn, user["id"], profile, day, stats["trend_kg_per_week"]
+        ),
         "theme": _theme_json(profile),
+        "weekly": _weekly_payload(conn, user["id"], profile, day),
         "day": _day_payload(conn, user["id"], profile, day),
         "today": {
             "date": day,
@@ -1341,6 +1527,8 @@ def create_app(settings, conn) -> web.Application:
     app.router.add_post("/api/sleep", post_sleep)
     app.router.add_get("/api/weights", get_weights)
     app.router.add_post("/api/weights", post_weight)
+    app.router.add_get("/api/weekly", get_weekly)
+    app.router.add_post("/api/weekly", post_weekly)
     app.router.add_get("/api/classes", get_classes)
     app.router.add_post("/api/classes", post_class)
     app.router.add_put("/api/classes/{class_id}", put_class)

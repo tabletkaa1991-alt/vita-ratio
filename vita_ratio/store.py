@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import date as date_cls
 from datetime import datetime, timedelta
@@ -169,8 +170,32 @@ def upsert_profile(conn: sqlite3.Connection, user_id: int, data: dict) -> dict:
 
 # --- приёмы пищи ----------------------------------------------------------------
 
+def parse_items(value) -> list[dict]:
+    """JSON-массив ингредиентов из ``meals.items_json`` -> list[dict] (мусор -> [])."""
+    if isinstance(value, list):
+        return [dict(item) for item in value if isinstance(item, dict)]
+    if not value:
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [dict(item) for item in parsed if isinstance(item, dict)]
+
+
+def _meal_row(row: sqlite3.Row | None) -> dict | None:
+    """Строка meals -> dict, где ``items`` уже распарсен (старые записи -> [])."""
+    data = _row(row)
+    if data is None:
+        return None
+    data["items"] = parse_items(data.get("items_json"))
+    return data
+
+
 def get_meal(conn: sqlite3.Connection, user_id: int, meal_id: int) -> dict | None:
-    return _row(
+    return _meal_row(
         conn.execute(
             "SELECT * FROM meals WHERE id = ? AND user_id = ?",
             (int(meal_id), int(user_id)),
@@ -191,11 +216,14 @@ def add_meal(
     note: str = "",
     grams: float = 0,
     food_key: str = "",
+    items: list[dict] | None = None,
 ) -> dict:
+    """Добавляет приём пищи; ``items`` — ингредиенты, сохраняются в JSON."""
     cursor = conn.execute(
         """
-        INSERT INTO meals (user_id, date, time, title, kcal, protein, fat, carbs, grams, food_key, note)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO meals (user_id, date, time, title, kcal, protein, fat, carbs,
+                           grams, food_key, items_json, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             int(user_id),
@@ -208,6 +236,7 @@ def add_meal(
             float(carbs),
             float(grams or 0),
             str(food_key or ""),
+            json.dumps(items or [], ensure_ascii=False),
             str(note or ""),
         ),
     )
@@ -216,12 +245,17 @@ def add_meal(
 
 
 def list_meals(conn: sqlite3.Connection, user_id: int, date: str) -> list[dict]:
-    return _rows(
-        conn.execute(
-            "SELECT * FROM meals WHERE user_id = ? AND date = ? ORDER BY time, id",
-            (int(user_id), str(date)),
+    return [
+        meal
+        for meal in (
+            _meal_row(row)
+            for row in conn.execute(
+                "SELECT * FROM meals WHERE user_id = ? AND date = ? ORDER BY time, id",
+                (int(user_id), str(date)),
+            )
         )
-    )
+        if meal is not None
+    ]
 
 
 def delete_meal(conn: sqlite3.Connection, user_id: int, meal_id: int) -> bool:
@@ -404,6 +438,68 @@ def goal_weights(
         "start_weight_kg": round(start, 1) if start else None,
         "current_weight_kg": round(current, 1) if current else None,
     }
+
+
+#: Допустимые значения самочувствия в недельном чек-ине (CONTRACT §14).
+WEEKLY_FEELINGS = ("good", "ok", "bad")
+
+
+# --- недельный чек-ин -----------------------------------------------------------
+
+def get_weekly_checkin(conn: sqlite3.Connection, user_id: int, week_start: str) -> dict | None:
+    """Чек-ин пользователя за конкретную ISO-неделю (по понедельнику)."""
+    return _row(
+        conn.execute(
+            "SELECT * FROM weekly_checkins WHERE user_id = ? AND week_start = ?",
+            (int(user_id), str(week_start)),
+        ).fetchone()
+    )
+
+
+def upsert_weekly_checkin(
+    conn: sqlite3.Connection,
+    user_id: int,
+    week_start: str,
+    weight_kg: float,
+    feeling: str = "ok",
+    note: str = "",
+) -> dict:
+    """Создаёт/обновляет чек-ин за неделю (UNIQUE user_id + week_start)."""
+    uid = int(user_id)
+    start = str(week_start)
+    conn.execute(
+        """
+        INSERT INTO weekly_checkins (user_id, week_start, weight_kg, feeling, note)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, week_start) DO UPDATE SET
+            weight_kg = excluded.weight_kg,
+            feeling   = excluded.feeling,
+            note      = excluded.note
+        """,
+        (uid, start, float(weight_kg), str(feeling or "ok"), str(note or "")),
+    )
+    conn.commit()
+    return get_weekly_checkin(conn, uid, start) or {}
+
+
+def last_weekly_checkin(conn: sqlite3.Connection, user_id: int) -> dict | None:
+    """Последний чек-ин пользователя по убыванию недели (или None)."""
+    return _row(
+        conn.execute(
+            "SELECT * FROM weekly_checkins WHERE user_id = ? ORDER BY week_start DESC LIMIT 1",
+            (int(user_id),),
+        ).fetchone()
+    )
+
+
+def list_weekly_checkins(conn: sqlite3.Connection, user_id: int, limit: int = 12) -> list[dict]:
+    """История чек-инов по убыванию недели."""
+    return _rows(
+        conn.execute(
+            "SELECT * FROM weekly_checkins WHERE user_id = ? ORDER BY week_start DESC LIMIT ?",
+            (int(user_id), max(int(limit), 1)),
+        )
+    )
 
 
 # --- занятия -------------------------------------------------------------------
