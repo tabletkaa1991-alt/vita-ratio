@@ -64,6 +64,10 @@ class Settings:
     robokassa_login: str = ""
     robokassa_password1: str = ""
     robokassa_password2: str = ""
+    # Бесплатный доступ (без подписки и без оплаты ИИ): Telegram ID через запятую
+    # и/или username без @ через запятую (регистр не важен).
+    free_access_ids: str = ""
+    free_access_usernames: str = ""
 
     @property
     def webapp_dir(self) -> Path:
@@ -131,4 +135,6 @@ def settings(from_env: bool = True) -> Settings:
         robokassa_login=get("ROBOKASSA_LOGIN", "").strip(),
         robokassa_password1=get("ROBOKASSA_PASSWORD1", "").strip(),
         robokassa_password2=get("ROBOKASSA_PASSWORD2", "").strip(),
+        free_access_ids=get("FREE_ACCESS_IDS", "").strip(),
+        free_access_usernames=get("FREE_ACCESS_USERNAMES", "").strip(),
     )

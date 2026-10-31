@@ -20,7 +20,7 @@ from pathlib import Path
 import aiohttp
 from aiohttp import web
 
-from . import __version__, auth, calc, foods, notify, payments, reports, store
+from . import __version__, access, auth, calc, foods, notify, payments, reports, store
 
 log = logging.getLogger("vita_ratio.api")
 
@@ -103,8 +103,13 @@ def ai_active(profile: dict | None, today: str) -> bool:
     return _is_date_active((profile or {}).get("ai_until"), today)
 
 
-def effective_ai(profile: dict | None, today: str) -> bool:
-    """Эффективный ИИ: флаг включён пользователем И оплачен до сегодня."""
+def effective_ai(profile: dict | None, today: str, free: bool = False) -> bool:
+    """Эффективный ИИ: флаг включён пользователем И оплачен до сегодня.
+
+    Для пользователей из белого списка (CONTRACT §29) ИИ доступен всегда.
+    """
+    if free:
+        return True
     return bool((profile or {}).get("ai_enabled")) and ai_active(profile, today)
 
 
@@ -113,20 +118,31 @@ def gate_enabled(settings_obj) -> bool:
     return bool(settings_obj.subscription_enforced) and not settings_obj.is_dev
 
 
+def is_free_user(settings_obj, user: dict | None) -> bool:
+    """True, если пользователю включён бесплатный доступ (CONTRACT §29)."""
+    if not user:
+        return False
+    return access.is_free(settings_obj, user.get("id"), user.get("username"))
+
+
 def subscription_gate(
     settings_obj,
     path: str,
     profile: dict | None,
     today: str,
     ai_required: bool = False,
+    free: bool = False,
 ) -> "ApiError | None":
     """Чистая проверка гейта: ``None`` — доступ есть, иначе :class:`ApiError` 402.
 
-    Пропускает не-API пути (статика/мини-приложение) и белый список §23.
+    Пропускает не-API пути (статика/мини-приложение), белый список §23 и
+    пользователей с бесплатным доступом (§29).
     Новый пользователь без профиля может создать его (онбординг) и получить триал —
     иначе триал, создаваемый вместе с профилем, был бы недостижим.
     """
     if not gate_enabled(settings_obj):
+        return None
+    if free:
         return None
     if not str(path).startswith("/api/"):
         return None
@@ -141,9 +157,32 @@ def subscription_gate(
     return None
 
 
-def _subscription_json(profile: dict | None, settings_obj, today: str) -> dict:
-    """Ответ GET /api/subscription и статусы подписки для bootstrap/profile."""
+def _subscription_json(
+    profile: dict | None, settings_obj, today: str, free: bool = False
+) -> dict:
+    """Ответ GET /api/subscription и статусы подписки для bootstrap/profile.
+
+    Для бесплатного доступа (§29) подписка и ИИ считаются активными бессрочно,
+    а даты окончания не показываются.
+    """
     profile = profile or {}
+    free = bool(free)
+    if free:
+        return {
+            "active": True,
+            "until": None,
+            "ai_active": True,
+            "ai_until": None,
+            "ai_enabled": True,
+            "base_price_rub": int(settings_obj.base_price_rub),
+            "base_price_stars": int(settings_obj.base_price_stars),
+            "ai_price_rub": int(settings_obj.ai_price_rub),
+            "ai_price_stars": int(settings_obj.ai_price_stars),
+            "period_days": int(settings_obj.sub_period_days),
+            "trial_days": int(settings_obj.trial_days),
+            "enforced": gate_enabled(settings_obj),
+            "free": True,
+        }
     return {
         "active": subscription_active(profile, today),
         "until": profile.get("sub_until") or None,
@@ -157,6 +196,7 @@ def _subscription_json(profile: dict | None, settings_obj, today: str) -> dict:
         "period_days": int(settings_obj.sub_period_days),
         "trial_days": int(settings_obj.trial_days),
         "enforced": gate_enabled(settings_obj),
+        "free": False,
     }
 
 
@@ -287,9 +327,12 @@ async def subscription_middleware(request: web.Request, handler) -> web.StreamRe
     if not path.startswith("/api/") or path in SUBSCRIPTION_FREE_PATHS:
         return await handler(request)
     user = auth.authenticate(request, settings_obj)
+    free = is_free_user(settings_obj, user)
+    if free:
+        return await handler(request)
     profile = store.get_profile(_conn(request), user["id"])
     today = calc.local_today(settings_obj.timezone)
-    error = subscription_gate(settings_obj, path, profile, today)
+    error = subscription_gate(settings_obj, path, profile, today, free=free)
     if error is not None:
         raise error
     return await handler(request)
@@ -488,10 +531,13 @@ def _user_json(user: dict) -> dict:
     }
 
 
-def _profile_json(profile: dict | None, today: str | None = None) -> dict | None:
+def _profile_json(
+    profile: dict | None, today: str | None = None, free: bool = False
+) -> dict | None:
     if not profile:
         return None
     day = today or calc.local_today()
+    free = bool(free)
     return {
         "sex": profile.get("sex"),
         "age": int(profile.get("age") or 0),
@@ -503,9 +549,10 @@ def _profile_json(profile: dict | None, today: str | None = None) -> dict | None
         "sleep_bed": profile.get("sleep_bed"),
         "sleep_wake": profile.get("sleep_wake"),
         "reminders": bool(profile.get("reminders")),
-        "ai_enabled": effective_ai(profile, day),
-        "sub_until": profile.get("sub_until") or None,
-        "ai_until": profile.get("ai_until") or None,
+        "ai_enabled": effective_ai(profile, day, free),
+        "sub_until": None if free else profile.get("sub_until") or None,
+        "ai_until": None if free else profile.get("ai_until") or None,
+        "free": free,
         "timezone": profile.get("timezone"),
         "goal_weight_kg": (
             _number(profile.get("goal_weight_kg"))
@@ -996,10 +1043,11 @@ async def get_profile(request: web.Request) -> web.Response:
     settings = _settings(request)
     profile = store.get_profile(_conn(request), user["id"])
     today = calc.local_today(settings.timezone)
+    free = is_free_user(settings, user)
     return json_ok({
-        "profile": _profile_json(profile, today),
+        "profile": _profile_json(profile, today, free),
         "targets": _targets_json(profile),
-        "subscription": _subscription_json(profile, settings, today),
+        "subscription": _subscription_json(profile, settings, today, free),
     })
 
 
@@ -1022,6 +1070,7 @@ async def put_profile(request: web.Request) -> web.Response:
             store.upsert_profile(conn, user["id"], {"ai_enabled": 1})
         profile = store.get_profile(conn, user["id"]) or profile
     targets = _targets_obj(profile).to_dict()
+    free = is_free_user(settings, user)
     if existing is None:
         # Первый профиль = онбординг завершён: поздравительное сообщение в чат.
         try:
@@ -1032,9 +1081,9 @@ async def put_profile(request: web.Request) -> web.Response:
         except RuntimeError:  # нет running loop (например, в тестах)
             pass
     return json_ok({
-        "profile": _profile_json(profile, today),
+        "profile": _profile_json(profile, today, free),
         "targets": targets,
-        "subscription": _subscription_json(profile, settings, today),
+        "subscription": _subscription_json(profile, settings, today, free),
     })
 
 
@@ -1410,9 +1459,9 @@ async def post_weight(request: web.Request) -> web.Response:
 
 # --- заметки и ИИ (v4/v5) --------------------------------------------------------
 
-def _ai_enabled(profile: dict | None, today: str) -> bool:
+def _ai_enabled(profile: dict | None, today: str, free: bool = False) -> bool:
     """Эффективный ИИ: флаг включён и аддон ai оплачен до сегодня (CONTRACT §22)."""
-    return effective_ai(profile, today)
+    return effective_ai(profile, today, free)
 
 
 async def get_notes(request: web.Request) -> web.Response:
@@ -1423,10 +1472,11 @@ async def get_notes(request: web.Request) -> web.Response:
     limit = _query_int(request, "limit", 30, 1, 100)
     profile = store.get_profile(conn, user["id"])
     today = calc.local_today(settings.timezone)
+    free = is_free_user(settings, user)
     return json_ok(
         {
             "notes": [_note_json(row) for row in store.list_notes(conn, user["id"], limit)],
-            "ai_enabled": _ai_enabled(profile, today),
+            "ai_enabled": _ai_enabled(profile, today, free),
         }
     )
 
@@ -1440,7 +1490,7 @@ async def post_note(request: web.Request) -> web.Response:
     text = _text_value(payload.get("text"), "text", 2000, required=True)
     profile = store.get_profile(conn, user["id"])
     today = calc.local_today(settings.timezone)
-    ai_enabled = _ai_enabled(profile, today)
+    ai_enabled = _ai_enabled(profile, today, is_free_user(settings, user))
     # Модель может думать до 20 с — не блокируем event loop.
     await asyncio.to_thread(
         reports.save_note, conn, user["id"], text, today, ai_enabled=ai_enabled
@@ -1466,14 +1516,15 @@ async def put_ai(request: web.Request) -> web.Response:
         raise _bad("Поле «enabled» должно быть true или false")
     today = calc.local_today(settings.timezone)
     profile = store.get_profile(conn, user["id"])
-    if enabled and gate_enabled(settings) and not ai_active(profile, today):
+    free = is_free_user(settings, user)
+    if enabled and gate_enabled(settings) and not free and not ai_active(profile, today):
         raise ApiError(
             402,
             "ai_subscription_required",
             "ИИ +100 ₽/мес — подключите для доступа",
         )
     profile = store.upsert_profile(conn, user["id"], {"ai_enabled": 1 if enabled else 0})
-    return json_ok({"ai_enabled": _ai_enabled(profile, today)})
+    return json_ok({"ai_enabled": _ai_enabled(profile, today, free)})
 
 
 # --- недельный чек-ин -----------------------------------------------------------
@@ -1529,7 +1580,7 @@ async def post_weekly(request: web.Request) -> web.Response:
     return json_ok(
         {
             "checkin": _checkin_json(checkin),
-            "profile": _profile_json(profile, day),
+            "profile": _profile_json(profile, day, is_free_user(settings, user)),
             "targets": _targets_json(profile),
             "goal": _goal_payload(conn, user["id"], profile, day, trend),
         }
@@ -1736,6 +1787,7 @@ async def get_bootstrap(request: web.Request) -> web.Response:
     profile = store.get_profile(conn, user["id"])
     classes = store.list_classes(conn, user["id"])
     now = calc.local_now(settings.timezone)
+    free = is_free_user(settings, user)
 
     meals = [_meal_json(row) for row in store.list_meals(conn, user["id"], day)]
     totals = _totals_json(conn, user["id"], day)
@@ -1749,10 +1801,11 @@ async def get_bootstrap(request: web.Request) -> web.Response:
         "user": _user_json(user),
         "profile": None,
         "targets": None,
-        "ai_enabled": _ai_enabled(profile, day),
-        "sub_until": (profile or {}).get("sub_until") or None,
-        "ai_until": (profile or {}).get("ai_until") or None,
-        "subscription": _subscription_json(profile, settings, day),
+        "ai_enabled": _ai_enabled(profile, day, free),
+        "sub_until": None if free else (profile or {}).get("sub_until") or None,
+        "ai_until": None if free else (profile or {}).get("ai_until") or None,
+        "subscription": _subscription_json(profile, settings, day, free),
+        "free": free,
         "goal": _goal_payload(
             conn, user["id"], profile, day, stats["trend_kg_per_week"]
         ),
@@ -1786,7 +1839,7 @@ async def get_bootstrap(request: web.Request) -> web.Response:
             1 for item in classes_today if item.get("status") == "present"
         )
         sleep_h = sleep_row["duration_h"] if sleep_row else None
-        data["profile"] = _profile_json(profile, day)
+        data["profile"] = _profile_json(profile, day, free)
         data["targets"] = targets_obj.to_dict()
         data["today"] = {
             "date": day,
@@ -1848,7 +1901,9 @@ async def get_subscription(request: web.Request) -> web.Response:
     conn = _conn(request)
     profile = store.get_profile(conn, user["id"])
     today = calc.local_today(settings_obj.timezone)
-    return json_ok(_subscription_json(profile, settings_obj, today))
+    return json_ok(
+        _subscription_json(profile, settings_obj, today, is_free_user(settings_obj, user))
+    )
 
 
 async def post_pay_invoice(request: web.Request) -> web.Response:
@@ -2204,7 +2259,9 @@ async def post_pay_refresh(request: web.Request) -> web.Response:
                 log.exception("refresh: не удалось активировать счёт %s", external_id)
     profile = store.get_profile(conn, user["id"])
     today = calc.local_today(settings_obj.timezone)
-    return json_ok(_subscription_json(profile, settings_obj, today))
+    return json_ok(
+        _subscription_json(profile, settings_obj, today, is_free_user(settings_obj, user))
+    )
 
 
 # --- сборка приложения ----------------------------------------------------------
@@ -2218,7 +2275,7 @@ async def get_export(request: web.Request) -> web.Response:
     fmt = (request.query.get("fmt") or "png").lower()
     profile = store.get_profile(conn, user["id"])
     today = calc.local_today(settings_obj.timezone)
-    use_llm = effective_ai(profile, today)
+    use_llm = effective_ai(profile, today, is_free_user(settings_obj, user))
     try:
         filename, payload = await asyncio.to_thread(
             reports.build, conn, user["id"], period, fmt, use_llm=use_llm)

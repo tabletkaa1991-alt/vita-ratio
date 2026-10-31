@@ -37,7 +37,7 @@ from aiogram.types import (
     WebAppInfo,
 )
 
-from . import calc, db, reports, store
+from . import access, calc, db, reports, store
 from .config import Settings
 from .config import settings as load_settings
 
@@ -125,8 +125,29 @@ def effective_ai(profile: Any, today: str) -> bool:
     return flag == 1 and _date_active(_dget(profile, "ai_until", None), today)
 
 
-def format_subscription(profile: Any, settings_obj: Settings, today: str) -> str:
-    """Текст /subscription: статус base/ai, даты и цены."""
+def _is_free_message(settings_obj: Settings, message: Message) -> bool:
+    """True, если отправителю включён бесплатный доступ (CONTRACT §29)."""
+    from_user = getattr(message, "from_user", None)
+    if from_user is None:
+        return False
+    return access.is_free(
+        settings_obj,
+        getattr(from_user, "id", None),
+        getattr(from_user, "username", None),
+    )
+
+
+def format_subscription(
+    profile: Any, settings_obj: Settings, today: str, free: bool = False
+) -> str:
+    """Текст /subscription: статус base/ai, даты и цены (или «бесплатно»)."""
+    if free:
+        return "\n".join([
+            "🎁 <b>Бесплатный доступ включён (бессрочно)</b>",
+            "",
+            "Бот и мини-приложение Vita Ratio доступны без подписки.",
+            "ИИ-разбор заметок и отчётов включён.",
+        ])
     profile = profile or {}
     sub_until = _dget(profile, "sub_until", None)
     ai_until = _dget(profile, "ai_until", None)
@@ -915,6 +936,8 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
         """Гейт команд: True — можно выполнять; иначе отправлен paywall."""
         if not (settings_obj.subscription_enforced and not settings_obj.is_dev):
             return True
+        if _is_free_message(settings_obj, message):
+            return True
         user_id = user_id_of(message)
         try:
             profile = get_profile(conn, user_id)
@@ -931,13 +954,18 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
     async def send_subscription(message: Message) -> None:
         """Статус подписки + inline-кнопки оплаты base/ai (CONTRACT §24)."""
         user_id = user_id_of(message)
+        free = _is_free_message(settings_obj, message)
         try:
             profile = get_profile(conn, user_id)
         except sqlite3.Error:
             log.exception("Не удалось прочитать профиль для /subscription (user_id=%s)", user_id)
             profile = None
         today = calc.local_today(default_tz)
-        text = format_subscription(profile, settings_obj, today)
+        text = format_subscription(profile, settings_obj, today, free)
+        if free:
+            # Бесплатный доступ: без цен и без кнопок оплаты.
+            await answer(message, text, open_app_keyboard(settings_obj.app_url))
+            return
         urls = await invoice_urls(
             settings_obj, user_id, base_active=subscription_active(profile, today)
         )
@@ -1076,7 +1104,7 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
         try:
             profile = get_profile(conn, user_id)
             today = calc.local_today(default_tz)
-            use_llm = effective_ai(profile, today)
+            use_llm = _is_free_message(settings_obj, message) or effective_ai(profile, today)
             filename, payload = await asyncio.to_thread(
                 reports.build, conn, user_id, period, fmt, use_llm=use_llm)
         except Exception:
@@ -1097,13 +1125,14 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
             await message.answer("✍️ Напиши так: <code>/note сегодня тяжело, мало спал</code>")
             return
         user_id = user_id_of(message)
+        free = _is_free_message(settings_obj, message)
         try:
             profile = get_profile(conn, user_id)
             today = calc.local_today(
                 _profile_tz(profile, default_tz) if profile else default_tz
             )
-            # v5: ИИ работает только при оплаченном ai_until (CONTRACT §22–24).
-            ai_enabled = effective_ai(profile, today)
+            # v5: ИИ работает при оплаченном ai_until (CONTRACT §22–24) или бесплатно.
+            ai_enabled = free or effective_ai(profile, today)
             reply = await asyncio.to_thread(
                 reports.save_note, conn, user_id, text, None, ai_enabled
             )
