@@ -2806,7 +2806,7 @@ body.modal-open {
 }
 
 /* ==========================================================================
-   ВЕРСИЯ 6 — отдельный экран «ИИ»: чат-коуч (CONTRACT §20/§25)
+   ВЕРСИЯ 8 — отдельный экран «ИИ»: свободный чат-ассистент (CONTRACT §31–34)
    ========================================================================== */
 
 /* ---------- шапка и статус подписки ---------- */
@@ -2885,7 +2885,8 @@ body.modal-open {
   background: linear-gradient(160deg, var(--accent-soft), var(--card-2));
 }
 
-.ai-msg--ai {
+.ai-msg--ai,
+.ai-msg--assistant {
   align-self: flex-start;
   border-bottom-left-radius: 6px;
   background: var(--card-2);
@@ -2975,35 +2976,6 @@ body.modal-open {
   font-size: 12px;
   line-height: 1.45;
   overflow-wrap: anywhere;
-}
-
-/* ---------- плашка «ИИ выключен» ---------- */
-
-.ai-off-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 10px 12px;
-  border-radius: 14px;
-  border: 1px solid rgba(245, 196, 107, 0.35);
-  background: rgba(245, 196, 107, 0.10);
-}
-
-.ai-off-banner__text {
-  min-width: 0;
-  margin: 0;
-  color: var(--warn);
-  font-size: 12.5px;
-  font-weight: 600;
-  overflow-wrap: anywhere;
-}
-
-.ai-off-banner__btn {
-  flex: none;
-  min-height: 36px;
-  padding: 6px 12px;
-  font-size: 12px;
 }
 
 /* ---------- закреплённый ввод над таб-баром ---------- */

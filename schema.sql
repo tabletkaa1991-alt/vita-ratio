@@ -181,4 +181,15 @@ CREATE TABLE IF NOT EXISTS free_access (
     created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Свободный чат с ИИ (обычный ассистент): история диалога, не привязанная к еде.
+CREATE TABLE IF NOT EXISTS ai_chat (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role       TEXT    NOT NULL CHECK (role IN ('user', 'assistant')),
+    text       TEXT    NOT NULL,
+    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ai_chat_user ON ai_chat(user_id, id);
+
+
 

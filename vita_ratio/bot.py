@@ -37,7 +37,7 @@ from aiogram.types import (
     WebAppInfo,
 )
 
-from . import access, calc, db, reports, store
+from . import access, ai, calc, db, reports, store
 from .config import Settings
 from .config import settings as load_settings
 
@@ -82,6 +82,7 @@ HELP_BODY = """<b>Команды</b>
 /export — отчёт за день, неделю или месяц: PNG, DOCX или XLSX
 /note — заметка с разбором ИИ (например: /note сегодня тяжело, мало спал)
 /notes — последние заметки и ответы ИИ
+/ask — спросить ИИ о чём угодно (учёба, код, тренировки; алиас /ai)
 /subscription — подписка и оплата (250 ₽/мес, ИИ +100 ₽/мес)
 /whoami — твой Telegram ID и username (нужно для бесплатного доступа)
 /help — эта справка
@@ -102,7 +103,7 @@ PAYWALL_TEXT = (
 #: Команды, которые работают всегда (вне платного гейта).
 FREE_COMMANDS = frozenset({
     "/start", "/menu", "/app", "/help", "/subscription", "/whoami",
-    "/grant", "/revoke", "/free_list",
+    "/grant", "/revoke", "/free_list", "/ask",
 })
 #: Команды, которым нужна активная base-подписка.
 GATED_COMMANDS = frozenset({
@@ -116,6 +117,7 @@ MENU_COMMANDS = (
     "/sleep — сон и окно питания",
     "/targets — цели по КБЖУ и воде",
     "/export — отчёт (PNG, DOCX, XLSX)",
+    "/ask — спросить ИИ о чём угодно",
     "/subscription — подписка и оплата",
     "/whoami — мой Telegram ID",
     "/help — полная справка",
@@ -1604,6 +1606,53 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
                 lines.append(f"🤖 {_esc(row['ai_text'][:300])}")
         await answer(message, "\n".join(lines))
 
+    @router.message(Command("ask", "ai"))
+    async def cmd_ask(message: Message) -> None:
+        """Свободный вопрос ИИ (алиас /ai): контекст из ai_chat, ответ до 4000.
+
+        Base-гейт здесь не нужен (``/ask`` в :data:`FREE_COMMANDS`): доступ
+        проверяется только по ИИ-тарифу, а при его отсутствии — подсказка
+        «ИИ +100 ₽/мес — /subscription».
+        """
+        question = _command_args(message)
+        if not question:
+            await message.answer("Напиши: /ask любой вопрос")
+            return
+        if len(question) > 2000:
+            await message.answer("Вопрос слишком длинный — до 2000 символов.")
+            return
+        user_id = user_id_of(message)
+        sender = _sender(message)
+        username = getattr(sender, "username", None) if sender else None
+        try:
+            profile = get_profile(conn, user_id)
+            today = calc.local_today(
+                _profile_tz(profile, default_tz) if profile else default_tz
+            )
+            # Гейт ИИ: free/промо или оплаченный ai_until (CONTRACT §22, §29).
+            if not ai.is_ai_available(
+                settings_obj,
+                user_id=user_id,
+                username=username,
+                conn=conn,
+                profile=profile,
+                today=today,
+            ):
+                await answer(message, "🔒 ИИ +100 ₽/мес — /subscription")
+                return
+            # История — до нового сообщения; в модель уходят последние 12.
+            history = store.list_chat_messages(conn, user_id, ai.HISTORY_LIMIT)
+            store.add_chat_message(conn, user_id, "user", question)
+            reply = await asyncio.to_thread(ai.chat_reply, history, question)
+            if not reply:
+                reply = ai.local_chat_fallback(question)
+            store.add_chat_message(conn, user_id, "assistant", reply)
+        except Exception:
+            log.exception("Ошибка /ask для user_id=%s", user_id)
+            await message.answer("😔 Не получилось ответить. Попробуй ещё раз чуть позже.")
+            return
+        await answer(message, _esc(reply[:4000]))
+
     return router
 
 
@@ -1768,6 +1817,7 @@ async def _set_commands(bot: Bot) -> None:
             BotCommand(command="export", description="Отчёт: день/неделя/месяц (png, docx, xlsx)"),
             BotCommand(command="note", description="Заметка с разбором ИИ"),
             BotCommand(command="notes", description="Последние заметки и ответы ИИ"),
+            BotCommand(command="ask", description="Спросить ИИ: любой вопрос (алиас /ai)"),
             BotCommand(command="subscription", description="Подписка и оплата (Stars)"),
             BotCommand(command="whoami", description="Мой Telegram ID и username"),
             BotCommand(command="grant", description="Владелец: выдать бесплатный доступ"),

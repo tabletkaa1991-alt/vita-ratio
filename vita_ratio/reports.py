@@ -190,6 +190,9 @@ def _local_comment(data: dict) -> str:
 #   * по умолчанию Pollinations — без ключа и регистрации;
 #   * если заданы AI_PROVIDER + AI_API_KEY — Gemini / Groq / OpenRouter / OpenAI
 #     (любой OpenAI-совместимый через AI_BASE_URL). При сбое — снова Pollinations.
+#
+# ``chat_completion`` — общая точка входа для любых диалогов (ИИ-чат, заметки,
+# отчёты): принимает OpenAI-подобные сообщения и возвращает текст или ``None``.
 
 SYSTEM = ("Ты нутрициолог-коуч приложения Vita Ratio. Отвечай по-русски, 2-4 предложения, "
           "конкретно и дружелюбно. Без списков и markdown.")
@@ -202,6 +205,67 @@ OPENAI_COMPAT = {
 }
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 GEMINI_MODEL = "gemini-2.5-flash"
+#: Допустимые роли сообщений (формат OpenAI chat completions).
+CHAT_ROLES = ("system", "user", "assistant")
+
+
+def _clean_messages(messages) -> list[dict]:
+    """Нормализует список сообщений: только известные роли и непустой текст."""
+    result: list[dict] = []
+    for item in messages or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "user").strip().lower()
+        if role not in CHAT_ROLES:
+            role = "user"
+        content = item.get("content")
+        text = str(content).strip() if content is not None else ""
+        if text:
+            result.append({"role": role, "content": text})
+    return result
+
+
+def _chat_messages(prompt) -> list[dict]:
+    """Сообщения для провайдера: готовый список либо старый «промпт отчёта»."""
+    if isinstance(prompt, (list, tuple)):
+        return _clean_messages(prompt)
+    return [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": str(prompt)},
+    ]
+
+
+def _flatten_messages(messages: list[dict]) -> str:
+    """Плоский текст диалога для GET Pollinations (без chat-формата)."""
+    labels = {"system": "Система", "user": "Пользователь", "assistant": "Ассистент"}
+    return "\n\n".join(
+        f"{labels.get(item['role'], 'Пользователь')}: {item['content']}" for item in messages
+    )
+
+
+def _gemini_payload(messages: list[dict], max_tokens: int) -> dict:
+    """Тело Gemini: systemInstruction + история (assistant -> model)."""
+    system_text = "\n\n".join(
+        item["content"] for item in messages if item["role"] == "system"
+    ).strip()
+    contents: list[dict] = []
+    for item in messages:
+        if item["role"] == "system":
+            continue
+        role = "model" if item["role"] == "assistant" else "user"
+        text = item["content"]
+        if contents and contents[-1]["role"] == role:
+            # Gemini ждёт чередование ролей: склеиваем соседние сообщения.
+            contents[-1]["parts"][0]["text"] += "\n\n" + text
+        else:
+            contents.append({"role": role, "parts": [{"text": text}]})
+    payload: dict = {
+        "contents": contents,
+        "generationConfig": {"temperature": 0.6, "maxOutputTokens": int(max_tokens)},
+    }
+    if system_text:
+        payload["systemInstruction"] = {"parts": [{"text": system_text}]}
+    return payload
 
 
 def _prompt(data: dict) -> str:
@@ -226,19 +290,33 @@ def _prompt(data: dict) -> str:
     return "\n".join(lines)
 
 
-def _provider_comment(prompt: str) -> str | None:
-    """Запрос к провайдеру с ключом (Gemini/Groq/OpenRouter/OpenAI). None при сбое."""
+def _provider_comment(prompt: str | list[dict], max_tokens: int = 220) -> str | None:
+    """Запрос к провайдеру с ключом (Gemini/Groq/OpenRouter/OpenAI). None при сбое.
+
+    ``prompt`` — либо готовый список сообщений (ИИ-чат), либо строка-промпт
+    отчёта (обратная совместимость с заметками/экспортом).
+    """
     provider = os.environ.get("AI_PROVIDER", "").strip().lower()
     api_key = os.environ.get("AI_API_KEY", "").strip()
     if not provider or not api_key:
         return None
     model = os.environ.get("AI_MODEL", "").strip()
+    dialogue = isinstance(prompt, (list, tuple))
+    messages = _chat_messages(prompt)
+    try:
+        limit = max(1, int(max_tokens))
+    except (TypeError, ValueError):
+        limit = 220
     try:
         if provider == "gemini":
-            body = json.dumps({
-                "contents": [{"parts": [{"text": f"{SYSTEM}\n\nДанные пользователя:\n{prompt}"}]}],
-                "generationConfig": {"temperature": 0.6, "maxOutputTokens": 220},
-            }).encode("utf-8")
+            if dialogue:
+                payload_body = _gemini_payload(messages, limit)
+            else:
+                payload_body = {
+                    "contents": [{"parts": [{"text": f"{SYSTEM}\n\nДанные пользователя:\n{prompt}"}]}],
+                    "generationConfig": {"temperature": 0.6, "maxOutputTokens": limit},
+                }
+            body = json.dumps(payload_body).encode("utf-8")
             url = GEMINI_URL.format(model=model or GEMINI_MODEL, key=api_key)
             headers = {"Content-Type": "application/json", "User-Agent": "vita-ratio/1.0"}
         else:
@@ -247,9 +325,9 @@ def _provider_comment(prompt: str) -> str | None:
                 return None
             body = json.dumps({
                 "model": model or default_model,
-                "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
+                "messages": messages,
                 "temperature": 0.6,
-                "max_tokens": 220,
+                "max_tokens": limit,
             }).encode("utf-8")
             url = base
             headers = {"Content-Type": "application/json", "User-Agent": "vita-ratio/1.0",
@@ -270,10 +348,20 @@ def _provider_comment(prompt: str) -> str | None:
         return None
 
 
-def _pollinations_comment(prompt: str) -> str | None:
+def _pollinations_comment(prompt: str | list[dict], max_tokens: int = 220) -> str | None:
     """Бесплатный fallback без ключа: GET, затем POST. None при сбое."""
     model = os.environ.get("AI_POLL_MODEL", "openai")
-    quoted = urllib.parse.quote(f"{SYSTEM}\n\nДанные пользователя:\n{prompt}", safe="")
+    dialogue = isinstance(prompt, (list, tuple))
+    messages = _chat_messages(prompt)
+    try:
+        limit = max(1, int(max_tokens))
+    except (TypeError, ValueError):
+        limit = 220
+    if dialogue:
+        flat = _flatten_messages(messages)
+    else:
+        flat = f"{SYSTEM}\n\nДанные пользователя:\n{prompt}"
+    quoted = urllib.parse.quote(flat, safe="")
     try:
         with urllib.request.urlopen(
             f"https://text.pollinations.ai/{quoted}?model={model}&private=true", timeout=15
@@ -285,9 +373,9 @@ def _pollinations_comment(prompt: str) -> str | None:
         log.warning("ai: GET не сработал (%s: %s)", type(exc).__name__, str(exc)[:100])
     body = json.dumps({
         "model": model,
-        "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
+        "messages": messages,
         "temperature": 0.6,
-        "max_tokens": 220,
+        "max_tokens": limit,
     }).encode("utf-8")
     request = urllib.request.Request(
         POLL_URL, data=body, method="POST",
@@ -302,9 +390,32 @@ def _pollinations_comment(prompt: str) -> str | None:
         return None
 
 
+def chat_completion(messages: list[dict], max_tokens: int = 400) -> str | None:
+    """Универсальный вызов модели по списку сообщений OpenAI-формата.
+
+    Порядок провайдеров: OpenAI-совместимый/Gemini по env (``AI_PROVIDER`` +
+    ``AI_API_KEY``), затем бесплатный Pollinations (GET, потом POST).
+    Возвращает текст ответа или ``None``, если все провайдеры недоступны.
+    """
+    cleaned = _clean_messages(messages)
+    if not cleaned:
+        return None
+    try:
+        limit = max(1, int(max_tokens))
+    except (TypeError, ValueError):
+        limit = 400
+    return (
+        _provider_comment(cleaned, max_tokens=limit)
+        or _pollinations_comment(cleaned, max_tokens=limit)
+    )
+
+
 def _llm_comment(prompt: str) -> str | None:
-    """Ответ модели: провайдер с ключом (если настроен), иначе бесплатный Pollinations."""
-    return _provider_comment(prompt) or _pollinations_comment(prompt)
+    """Ответ модели на промпт отчёта (через общий helper, лимит как раньше — 220)."""
+    return chat_completion(
+        [{"role": "system", "content": SYSTEM}, {"role": "user", "content": str(prompt)}],
+        max_tokens=220,
+    )
 
 
 def ai_comment(data: dict, use_llm: bool | None = None) -> str:

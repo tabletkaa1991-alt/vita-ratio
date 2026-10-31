@@ -105,10 +105,10 @@
       daySuggestions: []
     },
     progress: { weights: null, stats: null, loading: false },
-    /* Чат ИИ (CONTRACT §20/§25): отдельная загрузка, не блокирует остальные экраны. */
-    notes: {
-      items: [], aiEnabled: false, loading: false, loaded: false, reload: false,
-      saving: false, busy: false, pending: null, aiMissing: false
+    /* Чат ИИ (v8): отдельная загрузка, не блокирует остальные экраны. */
+    aiChat: {
+      items: [], active: null, loading: false, loaded: false, reload: false,
+      sending: false, pending: null, forcePaywall: false
     },
     /* Подписка (CONTRACT §22–25): GET /api/subscription + bootstrap.subscription. */
     subscription: { data: null, loading: false, loaded: false, reload: false, missing: false },
@@ -960,7 +960,13 @@
       state.subscription.loading = false;
       state.subscription.loaded = true;
       state.subscription.missing = false;
-      state.subscription.data = normalizeSubscription(data);
+      var normalized = normalizeSubscription(data);
+      state.subscription.data = normalized;
+      /* Оплатили/получили аддон — снимаем принудительный paywall экрана ИИ. */
+      if (normalized && normalized.ai_active === true) {
+        state.aiChat.forcePaywall = false;
+        state.aiChat.active = true;
+      }
       renderSubscription();
       if (state.subscription.reload) {
         state.subscription.reload = false;
@@ -1071,25 +1077,13 @@
     if (status === 'paid') {
       haptic('success');
       if (kind === 'ai') {
-        /* Оплатили аддон — включаем ИИ и перечитываем профиль/подписку/заметки. */
-        apiRequest('PUT', '/api/ai', { enabled: true }).then(function () {
-          setAiEnabled(true);
-          state.notes.aiMissing = false;
-          renderAiScreen();
-          toast('ИИ-разбор подключён');
-          afterPaymentRefresh();
-          loadAiHistory();
-        }).catch(function (error) {
-          var code = error && error.code;
-          if (code === 'base_required' || code === 'subscription_required' || code === 'http_402') {
-            state.pay.forcePaywall = true;
-            renderSubscription();
-            toast('Сначала оформи подписку Vita Ratio — 250 ₽/мес.', 'error');
-          } else {
-            toast(invoiceErrorText(code), 'error');
-          }
-          afterPaymentRefresh();
-        });
+        /* Оплатили аддон — сразу открываем чат, дальше подписка/история уточнят статус. */
+        state.aiChat.forcePaywall = false;
+        state.aiChat.active = true;
+        renderAiScreen();
+        toast('ИИ-ассистент подключён');
+        afterPaymentRefresh();
+        loadAiHistory();
         return;
       }
       /* Базовая подписка: скрываем paywall и перечитываем bootstrap. */
@@ -3748,28 +3742,29 @@
     });
   }
 
-  /* ======================= экран «ИИ»: чат-коуч (v6) ======================= */
+  /* ======================= экран «ИИ»: ассистент (v8) ======================= */
 
-  var NOTE_MAX_LENGTH = 2000;
+  var AI_MESSAGE_MAX_LENGTH = 2000;
+  var AI_EMPTY_TEXT = 'Задай любой вопрос — я помогу: учёба, тренировки, еда, код, что угодно.';
 
   function flagOn(value) {
     return value === true || value === 1 || value === '1' || value === 'true';
   }
 
-  /* Источник правды — state.bootstrap.profile.ai_enabled (CONTRACT §20):
-     нет поля / нет профиля → выключено. GET /api/notes, PUT /api/ai и
-     POST /api/notes синхронизируют флаг через setAiEnabled(). */
-  function aiEnabledNow() {
-    var profile = currentProfile();
-    if (!profile) { return !!state.notes.aiEnabled; }
-    return flagOn(profile.ai_enabled);
+  /* Доступ к чату: GET /api/ai/chat отдаёт ai_active; при 402 показываем paywall. */
+  function aiChatActive(sub) {
+    if (state.aiChat.forcePaywall) { return false; }
+    if (state.aiChat.active === true || state.aiChat.active === false) {
+      return state.aiChat.active;
+    }
+    return aiSubActive(sub);
   }
 
-  function setAiEnabled(enabled) {
-    var value = !!enabled;
-    state.notes.aiEnabled = value;
-    var profile = currentProfile();
-    if (profile) { profile.ai_enabled = value; }
+  function showAiPaywall() {
+    state.aiChat.forcePaywall = true;
+    state.aiChat.active = false;
+    renderAiScreen();
+    loadSubscription({ force: true });
   }
 
   function aiSubActive(sub) {
@@ -3793,12 +3788,11 @@
     return 'ИИ ' + aiPriceLabel(sub);
   }
 
-  /* Единый рендер экрана ИИ: статус подписки, paywall аддона, плашка
-     «ИИ выключен», поле ввода и история чата. */
+  /* Единый рендер экрана ИИ: статус подписки, paywall аддона, поле ввода
+     и история чата с ассистентом. */
   function renderAiScreen() {
     var sub = subscriptionPayload();
-    var active = aiSubActive(sub);
-    var enabled = aiEnabledNow();
+    var active = aiChatActive(sub);
 
     var status = byId('ai-screen-status');
     if (status) {
@@ -3823,7 +3817,7 @@
         payText.textContent = 'Сначала оформи подписку Vita Ratio — ' +
           fmtInt(sub.base_price_rub) + ' ₽/мес.';
       } else {
-        payText.textContent = 'ИИ-коуч разбирает заметки и подсказывает, что поправить в питании, сне и тренировках.';
+        payText.textContent = 'ИИ-ассистент отвечает на любые вопросы: учёба, тренировки, еда, код, что угодно.';
       }
     }
     var subscribeBtn = byId('ai-subscribe-btn');
@@ -3832,47 +3826,20 @@
       setBusy(subscribeBtn, !!state.pay.aiBusy);
     }
 
-    /* ai_active=true, но пользователь выключил разбор — плашка с кнопкой. */
-    var offBanner = byId('ai-off-banner');
-    var showOff = active && (!enabled || state.notes.aiMissing);
-    if (offBanner) { offBanner.hidden = !showOff; }
-    var offText = byId('ai-off-banner-text');
-    if (offText) {
-      offText.textContent = state.notes.aiMissing && enabled
-        ? 'ИИ не ответил — попробуй ещё раз'
-        : 'ИИ выключен';
-    }
-    var enableBtn = byId('ai-enable-btn');
-    if (enableBtn) {
-      enableBtn.textContent = enabled ? 'Обновить' : 'Включить ИИ';
-      setBusy(enableBtn, !!state.notes.busy);
-    }
-
     var send = byId('ai-send');
-    if (send) { setBusy(send, !!state.notes.saving); }
+    if (send) { setBusy(send, !!state.aiChat.sending); }
 
     renderAiChat();
   }
 
-  function noteDateText(note) {
-    var iso = String((note && (note.date || note.created_at)) || '').slice(0, 10);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) { return ''; }
-    return dateShort(iso);
-  }
-
-  function aiNoteHtml(note) {
-    var dateText = noteDateText(note);
-    var aiText = String((note && note.ai_text) || '').trim();
-    var html = '<li class="ai-msg ai-msg--user">' +
-      (dateText ? '<span class="ai-msg__meta">' + esc(dateText) + '</span>' : '') +
-      '<p class="ai-msg__text">' + esc((note && note.text) || '') + '</p>' +
-    '</li>';
-    if (aiText) {
-      html += '<li class="ai-msg ai-msg--ai">' +
-        '<span class="ai-msg__meta">🤖 ИИ-коуч</span>' +
-        '<p class="ai-msg__text">' + esc(aiText) + '</p>' +
-      '</li>';
+  function aiMessageHtml(message) {
+    var role = message && message.role === 'assistant' ? 'assistant' : 'user';
+    var modifier = role === 'assistant' ? 'ai-msg--assistant' : 'ai-msg--user';
+    var html = '<li class="ai-msg ' + modifier + '">';
+    if (role === 'assistant') {
+      html += '<span class="ai-msg__meta">🤖 ИИ</span>';
     }
+    html += '<p class="ai-msg__text">' + esc((message && message.text) || '') + '</p></li>';
     return html;
   }
 
@@ -3881,27 +3848,24 @@
     var empty = byId('ai-chat-empty');
     var typing = byId('ai-typing');
     if (!list || !empty) { return; }
-    /* API отдаёт новые сверху — в чате показываем старые сверху, новые снизу. */
-    var items = (state.notes.items || []).slice().reverse();
-    var html = items.map(aiNoteHtml).join('');
-    if (state.notes.pending) {
+    /* API отдаёт историю в хронологическом порядке: старые сверху, новые снизу. */
+    var items = state.aiChat.items || [];
+    var html = items.map(aiMessageHtml).join('');
+    if (state.aiChat.pending) {
       html += '<li class="ai-msg ai-msg--user ai-msg--pending">' +
-        '<span class="ai-msg__meta">Сейчас</span>' +
-        '<p class="ai-msg__text">' + esc(state.notes.pending) + '</p>' +
+        '<p class="ai-msg__text">' + esc(state.aiChat.pending.text) + '</p>' +
       '</li>';
     }
     list.innerHTML = html;
-    /* Индикатор «ИИ печатает…» (#ai-typing) виден, пока ждём POST /api/notes. */
-    if (typing) { typing.hidden = !state.notes.saving; }
-    var hasMessages = items.length > 0 || !!state.notes.pending;
+    /* Индикатор «ИИ печатает…» (#ai-typing) виден, пока ждём POST /api/ai/chat. */
+    if (typing) { typing.hidden = !state.aiChat.sending; }
+    var hasMessages = items.length > 0 || !!state.aiChat.pending;
     empty.hidden = hasMessages;
     if (!hasMessages) {
-      if (state.notes.loading) {
+      if (state.aiChat.loading) {
         empty.textContent = 'Загружаю историю…';
-      } else if (state.notes.loaded) {
-        empty.textContent = aiSubActive(subscriptionPayload())
-          ? 'Пока пусто — напиши первую заметку, и ИИ-коуч разберёт её.'
-          : 'ИИ пока не подключён. Подключи разбор — и начнём с заметок.';
+      } else if (state.aiChat.loaded) {
+        empty.textContent = AI_EMPTY_TEXT;
       } else {
         empty.textContent = 'История не загрузилась — попробуй позже.';
       }
@@ -3916,76 +3880,44 @@
     }, 40);
   }
 
-  /* История грузится отдельным запросом: медленный /api/notes не блокирует
+  /* История грузится отдельным запросом: медленный /api/ai/chat не блокирует
      остальные экраны, а ошибка остаётся тихой (без тоста). */
   function loadAiHistory() {
-    if (state.notes.loading) {
-      state.notes.reload = true;
+    if (state.aiChat.loading) {
+      state.aiChat.reload = true;
       return;
     }
-    state.notes.loading = true;
+    state.aiChat.loading = true;
     renderAiChat();
-    apiRequest('GET', '/api/notes?limit=30').then(function (data) {
-      state.notes.loading = false;
-      state.notes.loaded = true;
-      state.notes.items = ((data && data.notes) || []).slice(0, 30);
-      if (data && typeof data.ai_enabled === 'boolean') { setAiEnabled(data.ai_enabled); }
+    apiRequest('GET', '/api/ai/chat?limit=30').then(function (data) {
+      state.aiChat.loading = false;
+      state.aiChat.loaded = true;
+      state.aiChat.items = ((data && data.messages) || []).filter(function (message) {
+        return message && (message.role === 'user' || message.role === 'assistant') &&
+          String(message.text || '').trim();
+      }).slice(0, 30);
+      if (data && typeof data.ai_active === 'boolean') {
+        state.aiChat.active = data.ai_active;
+        if (data.ai_active) { state.aiChat.forcePaywall = false; }
+      }
       renderAiScreen();
-      if (state.notes.reload) {
-        state.notes.reload = false;
+      if (state.aiChat.reload) {
+        state.aiChat.reload = false;
         loadAiHistory();
       }
-    }).catch(function () {
-      state.notes.loading = false;
-      if (!state.notes.loaded) { state.notes.items = []; }
-      renderAiChat();
-      if (state.notes.reload) {
-        state.notes.reload = false;
-        loadAiHistory();
-      }
-    });
-  }
-
-  function aiErrorToast(code) {
-    if (code === 'ai_subscription_required') {
-      toast('ИИ-разбор — отдельный аддон +100 ₽/мес.', 'error');
-      loadSubscription();
-      return;
-    }
-    if (code === 'subscription_required' || code === 'http_402') {
-      toast('Нужна подписка Vita Ratio — 250 ₽/мес.', 'error');
-      loadSubscription();
-      return;
-    }
-    toast(code === 'http_404' || code === 'not_found'
-      ? 'ИИ пока недоступен — попробуй позже.'
-      : errorText(code), 'error');
-  }
-
-  function enableAi() {
-    if (state.notes.busy) { return; }
-    if (aiEnabledNow()) {
-      /* «Обновить»: перечитываем статус и историю после ручной правки. */
-      loadAiHistory();
-      loadSubscription();
-      return;
-    }
-    state.notes.busy = true;
-    renderAiScreen();
-    haptic('select');
-    apiRequest('PUT', '/api/ai', { enabled: true }).then(function (data) {
-      state.notes.busy = false;
-      setAiEnabled(data && typeof data.ai_enabled === 'boolean' ? data.ai_enabled : true);
-      state.notes.aiMissing = false;
-      renderAiScreen();
-      haptic('success');
-      toast('ИИ включён — новые заметки получат разбор');
-      loadAiHistory();
     }).catch(function (error) {
-      state.notes.busy = false;
+      state.aiChat.loading = false;
+      if (!state.aiChat.loaded) { state.aiChat.items = []; }
+      var code = error && error.code;
+      if (code === 'ai_subscription_required' || code === 'http_402') {
+        state.aiChat.active = false;
+        state.aiChat.forcePaywall = true;
+      }
       renderAiScreen();
-      haptic('error');
-      aiErrorToast(error && error.code);
+      if (state.aiChat.reload) {
+        state.aiChat.reload = false;
+        loadAiHistory();
+      }
     });
   }
 
@@ -4005,7 +3937,7 @@
 
   function submitAiMessage(event) {
     if (event && typeof event.preventDefault === 'function') { event.preventDefault(); }
-    if (state.notes.saving) { return; }
+    if (state.aiChat.sending) { return; }
     var input = byId('ai-input');
     var text = String(input ? input.value : '').trim();
     if (!text) {
@@ -4014,50 +3946,60 @@
       if (input) { try { input.focus(); } catch (error) { /* noop */ } }
       return;
     }
-    if (text.length > NOTE_MAX_LENGTH) {
-      toast('Сообщение — до ' + NOTE_MAX_LENGTH + ' символов', 'error');
+    if (text.length > AI_MESSAGE_MAX_LENGTH) {
+      toast('Сообщение — до ' + AI_MESSAGE_MAX_LENGTH + ' символов', 'error');
       haptic('error');
       return;
     }
-    if (!aiSubActive(subscriptionPayload())) {
+    if (!aiChatActive(subscriptionPayload())) {
       toast('ИИ не подключён — подключи +100 ₽/мес', 'error');
       renderAiScreen();
       return;
     }
     var send = byId('ai-send');
-    state.notes.saving = true;
-    state.notes.pending = text;
-    state.notes.aiMissing = false;
+    var now = new Date().toISOString();
+    state.aiChat.sending = true;
+    state.aiChat.pending = { role: 'user', text: text, created_at: now };
     if (input) { input.value = ''; syncAiInputHeight(); }
     setBusy(send, true);
     renderAiChat();
     scrollAiToBottom();
     haptic('select');
-    apiRequest('POST', '/api/notes', { text: text }).then(function (data) {
-      state.notes.saving = false;
-      state.notes.pending = null;
-      if (data && typeof data.ai_enabled === 'boolean') { setAiEnabled(data.ai_enabled); }
-      var note = (data && data.note) || { date: todayIso(), text: text, ai_text: '' };
-      if (!note.text) { note.text = text; }
-      var aiText = String(note.ai_text || '').trim();
-      state.notes.aiMissing = !aiText;
-      state.notes.items = [note].concat(state.notes.items || []).slice(0, 30);
-      state.notes.loaded = true;
-      renderAiScreen();
-      haptic(aiText ? 'success' : 'warning');
-      if (!aiText) {
-        toast('ИИ выключен — заметка сохранена без разбора');
+    apiRequest('POST', '/api/ai/chat', { text: text }).then(function (data) {
+      state.aiChat.sending = false;
+      state.aiChat.pending = null;
+      var reply = String((data && data.reply) || '').trim();
+      if (!reply) { throw makeError('bad_response'); }
+      var stamp = new Date().toISOString();
+      state.aiChat.items = (state.aiChat.items || []).concat([
+        { id: 'local-user-' + stamp, role: 'user', text: text, created_at: stamp },
+        { id: 'local-ai-' + stamp, role: 'assistant', text: reply, created_at: stamp }
+      ]);
+      if (data && typeof data.ai_active === 'boolean') {
+        state.aiChat.active = data.ai_active;
+        if (data.ai_active) { state.aiChat.forcePaywall = false; }
       }
+      state.aiChat.loaded = true;
+      setBusy(send, false);
+      renderAiScreen();
+      haptic('success');
       scrollAiToBottom();
       loadAiHistory(); // сверяем локальную запись с сервером
     }).catch(function (error) {
-      state.notes.saving = false;
-      state.notes.pending = null;
+      state.aiChat.sending = false;
+      state.aiChat.pending = null;
       setBusy(send, false);
+      /* Текст не теряем: возвращаем его в поле, если пользователь ещё не начал новое. */
       if (input && !input.value) { input.value = text; syncAiInputHeight(); }
-      renderAiScreen();
+      renderAiChat();
       haptic('error');
-      aiErrorToast(error && error.code); /* текст не теряем */
+      var code = error && error.code;
+      if (code === 'ai_subscription_required' || code === 'http_402') {
+        /* Нет оплаченного/триального ИИ — показываем paywall аддона. */
+        showAiPaywall();
+        return;
+      }
+      toast('Не получилось, попробуй ещё раз', 'error');
     });
   }
 
@@ -4454,11 +4396,10 @@
     });
     byId('btn-theme-reset').addEventListener('click', resetTheme);
 
-    // Экран «ИИ»: чат-коуч и аддон ИИ (v6)
+    // Экран «ИИ»: чат-ассистент и аддон ИИ (v8)
     byId('ai-composer').addEventListener('submit', submitAiMessage);
     byId('ai-input').addEventListener('input', syncAiInputHeight);
     byId('ai-input').addEventListener('keydown', onAiInputKeydown);
-    byId('ai-enable-btn').addEventListener('click', enableAi);
 
     // Подписка (v5): блокирующий paywall и аддон ИИ
     byId('sub-pay-btn').addEventListener('click', payBase);

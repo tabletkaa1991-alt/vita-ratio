@@ -530,6 +530,75 @@ def list_notes(conn: sqlite3.Connection, user_id: int, limit: int = 30) -> list[
     )
 
 
+# --- свободный ИИ-чат ----------------------------------------------------------
+
+#: Роли сообщений в ``ai_chat`` (CHECK в schema.sql).
+CHAT_ROLES = ("user", "assistant")
+
+
+def add_chat_message(
+    conn: sqlite3.Connection, user_id: int, role: str, text: str
+) -> dict:
+    """Добавляет сообщение в ``ai_chat`` и возвращает ``{id, role, text, created_at}``.
+
+    ``role`` — только ``user``/``assistant``; пустой текст/роль — ``ValueError``
+    (валидация длины и текста остаётся на вызывающем слое: API/бот).
+    """
+    normalized_role = str(role or "").strip().lower()
+    if normalized_role not in CHAT_ROLES:
+        raise ValueError("role должен быть user или assistant")
+    content = str(text or "").strip()
+    if not content:
+        raise ValueError("text не может быть пустым")
+    cursor = conn.execute(
+        "INSERT INTO ai_chat (user_id, role, text) VALUES (?, ?, ?)",
+        (int(user_id), normalized_role, content),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT id, role, text, created_at FROM ai_chat WHERE id = ?",
+        (cursor.lastrowid,),
+    ).fetchone()
+    return _row(row) or {
+        "id": int(cursor.lastrowid or 0),
+        "role": normalized_role,
+        "text": content,
+        "created_at": "",
+    }
+
+
+def list_chat_messages(
+    conn: sqlite3.Connection, user_id: int, limit: int = 30
+) -> list[dict]:
+    """Последние ``limit`` сообщений чата в **хронологическом** порядке.
+
+    Из БД берём новые сверху (``ORDER BY id DESC LIMIT``), затем разворачиваем
+    список — для ленты чата и контекста модели нужен порядок «сверху вниз».
+    """
+    try:
+        cap = max(int(limit), 1)
+    except (TypeError, ValueError):
+        cap = 30
+    rows = conn.execute(
+        """
+        SELECT id, role, text, created_at
+        FROM ai_chat
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(user_id), cap),
+    ).fetchall()
+    return [dict(row) for row in reversed(rows)]
+
+
+def clear_chat(conn: sqlite3.Connection, user_id: int) -> int:
+    """Удаляет всю историю чата пользователя. Возвращает число удалённых строк."""
+    cursor = conn.execute("DELETE FROM ai_chat WHERE user_id = ?", (int(user_id),))
+    conn.commit()
+    return int(cursor.rowcount or 0)
+
+
 # --- занятия -------------------------------------------------------------------
 
 def get_class(conn: sqlite3.Connection, user_id: int, class_id: int) -> dict | None:

@@ -693,7 +693,7 @@
             </div>
           </article>
 
-          <!-- Заметки и чат с ИИ вынесены на отдельный экран «ИИ» (v6). -->
+          <!-- Чат с ИИ-ассистентом вынесен на отдельный экран «ИИ» (v8). -->
           <p id="subscription-status" class="subscription-status" hidden></p>
 
           <article class="card" aria-label="Профиль и цели">
@@ -784,8 +784,8 @@
       <section id="screen-ai" class="screen" data-screen="ai" aria-labelledby="ai-title">
         <header class="screen-head ai-head">
           <div>
-            <p class="eyebrow">Коуч</p>
-            <h1 id="ai-title" class="title title--sm">ИИ-коуч</h1>
+            <p class="eyebrow">Ассистент</p>
+            <h1 id="ai-title" class="title title--sm">ИИ-ассистент</h1>
           </div>
           <p id="ai-screen-status" class="ai-screen-status" aria-live="polite">ИИ +100 ₽/мес</p>
         </header>
@@ -794,32 +794,26 @@
           <!-- Paywall ИИ-аддона: показывается вместо поля ввода, если ai_active=false (CONTRACT §25). -->
           <article id="ai-paywall" class="card ai-paywall" aria-label="Подключение ИИ" hidden>
             <div class="card__head">
-              <p class="card__label">ИИ-разбор</p>
+              <p class="card__label">ИИ-ассистент</p>
               <span id="ai-paywall-price" class="ai-paywall__price">+100 ₽/мес</span>
             </div>
-            <p id="ai-paywall-text" class="muted">ИИ-коуч разбирает заметки и подсказывает, что поправить в питании, сне и тренировках.</p>
+            <p id="ai-paywall-text" class="muted">ИИ-ассистент отвечает на любые вопросы: учёба, тренировки, еда, код, что угодно.</p>
             <button type="button" id="ai-subscribe-btn" class="btn btn--accent btn--wide">Подключить ИИ · +100 ₽/мес</button>
             <p id="ai-paywall-note" class="ai-paywall__note" hidden></p>
           </article>
 
-          <!-- Плашка «ИИ выключен» (ai_active=true, но ai_enabled=false). -->
-          <article id="ai-off-banner" class="ai-off-banner" aria-live="polite" hidden>
-            <p id="ai-off-banner-text" class="ai-off-banner__text">ИИ выключен</p>
-            <button type="button" id="ai-enable-btn" class="btn btn--ghost ai-off-banner__btn">Включить ИИ</button>
-          </article>
-
           <div class="ai-chat">
             <ul id="ai-chat-list" class="ai-chat-list" aria-live="polite"></ul>
-            <p id="ai-chat-empty" class="empty">Пока пусто — напиши первую заметку, и ИИ-коуч разберёт её.</p>
+            <p id="ai-chat-empty" class="empty">Задай любой вопрос — я помогу: учёба, тренировки, еда, код, что угодно.</p>
             <p id="ai-typing" class="ai-typing" hidden>🤖 ИИ печатает…</p>
           </div>
         </div>
 
         <!-- Ввод закреплён снизу над таб-баром, отступ учитывает safe-area. -->
         <form id="ai-composer" class="ai-composer" novalidate hidden>
-          <label class="visually-hidden" for="ai-input">Сообщение ИИ-коучу</label>
+          <label class="visually-hidden" for="ai-input">Сообщение ИИ-ассистенту</label>
           <textarea id="ai-input" maxlength="2000" rows="1"
-                    placeholder="Сообщение ИИ-коучу…"></textarea>
+                    placeholder="Спроси что угодно…"></textarea>
           <button type="submit" id="ai-send" class="btn btn--accent ai-send">Отправить</button>
         </form>
       </section>

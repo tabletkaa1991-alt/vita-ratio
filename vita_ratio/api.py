@@ -20,7 +20,7 @@ from pathlib import Path
 import aiohttp
 from aiohttp import web
 
-from . import __version__, access, auth, calc, foods, notify, payments, reports, store
+from . import __version__, access, ai, auth, calc, foods, notify, payments, reports, store
 
 log = logging.getLogger("vita_ratio.api")
 
@@ -74,6 +74,9 @@ SUBSCRIPTION_FREE_PATHS = frozenset({
     "/api/subscription",
     "/api/pay/invoice",
     "/api/pay/refresh",
+    # Свободный ИИ-чат закрыт только ИИ-гейтом (402 ai_subscription_required),
+    # а не base-подпиской: экран «ИИ» должен показывать свой paywall.
+    "/api/ai/chat",
     # Вебхуки эквайринга: публичные, подлинность проверяется провайдером.
     "/api/pay/yookassa",
     "/api/pay/robokassa/result",
@@ -1546,6 +1549,84 @@ async def put_ai(request: web.Request) -> web.Response:
     return json_ok({"ai_enabled": _ai_enabled(profile, today, free)})
 
 
+# --- свободный ИИ-чат (v8) -----------------------------------------------------
+
+def _chat_json(row: dict) -> dict:
+    """Сообщение чата для API: только публичные поля."""
+    return {
+        "id": int(row.get("id") or 0),
+        "role": str(row.get("role") or ""),
+        "text": str(row.get("text") or ""),
+        "created_at": str(row.get("created_at") or ""),
+    }
+
+
+async def get_ai_chat(request: web.Request) -> web.Response:
+    """GET /api/ai/chat?limit=30 — история чата (хронологически) и статус ИИ."""
+    user = _user(request)
+    settings = _settings(request)
+    conn = _conn(request)
+    limit = _query_int(request, "limit", 30, 1, 100)
+    profile = store.get_profile(conn, user["id"])
+    today = calc.local_today(settings.timezone)
+    available = ai.is_ai_available(
+        settings,
+        user_id=user["id"],
+        username=user.get("username"),
+        conn=conn,
+        profile=profile,
+        today=today,
+    )
+    rows = store.list_chat_messages(conn, user["id"], limit)
+    return json_ok(
+        {
+            "messages": [_chat_json(row) for row in rows],
+            "ai_active": bool(available),
+        }
+    )
+
+
+async def post_ai_chat(request: web.Request) -> web.Response:
+    """POST /api/ai/chat {"text"} — свободный вопрос ИИ с контекстом диалога.
+
+    Гейт — только ИИ-доступ (как у ИИ-разбора заметок): при неактивном аддоне
+    402 ``ai_subscription_required``. При сбое модели чат не ломается: ответ
+    подменяется :func:`ai.local_chat_fallback`, обе реплики сохраняются.
+    """
+    user = _user(request)
+    settings = _settings(request)
+    conn = _conn(request)
+    payload = await _body(request)
+    text = _text_value(payload.get("text"), "text", 2000, required=True)
+    profile = store.get_profile(conn, user["id"])
+    today = calc.local_today(settings.timezone)
+    if not ai.is_ai_available(
+        settings,
+        user_id=user["id"],
+        username=user.get("username"),
+        conn=conn,
+        profile=profile,
+        today=today,
+    ):
+        raise ApiError(
+            402,
+            "ai_subscription_required",
+            "ИИ +100 ₽/мес — подключите для доступа",
+        )
+    # История — строго ДО нового сообщения; в модель уходят последние 12.
+    history = store.list_chat_messages(conn, user["id"], ai.HISTORY_LIMIT)
+    store.add_chat_message(conn, user["id"], "user", text)
+    try:
+        reply = await asyncio.to_thread(ai.chat_reply, history, text)
+    except Exception:  # noqa: BLE001 — модель/сеть: отдаём честный локальный ответ
+        log.exception("ai-chat: ошибка вызова модели (user_id=%s)", user["id"])
+        reply = None
+    if not reply:
+        reply = ai.local_chat_fallback(text)
+    store.add_chat_message(conn, user["id"], "assistant", reply)
+    return json_ok({"reply": reply, "ai_active": True})
+
+
 # --- недельный чек-ин -----------------------------------------------------------
 
 def _feeling_value(value) -> str:
@@ -2360,6 +2441,8 @@ def create_app(settings, conn) -> web.Application:
     app.router.add_get("/api/notes", get_notes)
     app.router.add_post("/api/notes", post_note)
     app.router.add_put("/api/ai", put_ai)
+    app.router.add_get("/api/ai/chat", get_ai_chat)
+    app.router.add_post("/api/ai/chat", post_ai_chat)
 
     app.router.add_get("/", index)
     app.router.add_get("/static/{name}", static_file)
