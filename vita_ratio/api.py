@@ -1015,6 +1015,11 @@ async def put_profile(request: web.Request) -> web.Response:
     if existing is None:
         # Новый профиль получает триал (CONTRACT §22): sub_until = today + TRIAL_DAYS.
         store.ensure_trial(conn, user["id"], settings.trial_days, today=today)
+        # Промо-доступ к ИИ-аддону, если включён AI_TRIAL_DAYS (0 = только платно).
+        if settings.ai_trial_days > 0:
+            ai_trial = (date_cls.fromisoformat(today) + timedelta(days=settings.ai_trial_days)).isoformat()
+            store.set_subscription(conn, user["id"], ai_until=ai_trial)
+            store.upsert_profile(conn, user["id"], {"ai_enabled": 1})
         profile = store.get_profile(conn, user["id"]) or profile
     targets = _targets_obj(profile).to_dict()
     if existing is None:

@@ -55,6 +55,7 @@ class Settings:
     ai_price_stars: int = 60
     sub_period_days: int = 30
     trial_days: int = 7
+    ai_trial_days: int = 0  # промо-доступ к ИИ-аддону на время триала (0 = платный сразу)
     subscription_enforced: bool = True
     # Рублёвый эквайринг (карта → карта самозанятого): stars | yookassa | robokassa | manual
     pay_provider: str = "stars"

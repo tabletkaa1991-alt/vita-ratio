@@ -3269,34 +3269,3 @@ body.paywall-open {
   }
 }
 
-/* ==========================================================================
-   ВЕРСИЯ 6 fix — экран «ИИ»: чат на всю высоту, ввод прижат к низу
-   (fixed внутри анимированного .screen позиционировался неверно)
-   ========================================================================== */
-
-#screen-ai.is-active {
-  display: flex;
-  flex-direction: column;
-  position: relative;
-  min-height: calc(100dvh - var(--tabbar-h) - 70px);
-}
-
-#screen-ai .ai-head {
-  flex: 0 0 auto;
-}
-
-#screen-ai .ai-content {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  padding-bottom: 104px;
-}
-
-#screen-ai .ai-composer {
-  position: absolute;
-  left: 10px;
-  right: 10px;
-  bottom: 6px;
-  margin: 0;
-}
