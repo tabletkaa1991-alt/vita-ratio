@@ -39,7 +39,8 @@ def _bounds(period: str, today: str) -> tuple[str, str, str]:
     return day.isoformat(), day.isoformat(), f"День ({day:%d.%m.%Y})"
 
 
-def collect(conn: sqlite3.Connection, user_id: int, period: str = "day", today: str | None = None) -> dict:
+def collect(conn: sqlite3.Connection, user_id: int, period: str = "day", today: str | None = None,
+            comment: bool = True) -> dict:
     """Сводка за период: профиль, цели, дни, сон, вес, план, занятия, заметки."""
     today = today or calc.local_today()
     start, end, label = _bounds(period, today)
@@ -119,7 +120,7 @@ def collect(conn: sqlite3.Connection, user_id: int, period: str = "day", today: 
         },
         "notes": notes,
     }
-    data["comment"] = ai_comment(data)
+    data["comment"] = ai_comment(data) if comment else ""
     return data
 
 
@@ -316,12 +317,24 @@ def ai_comment(data: dict, use_llm: bool | None = None) -> str:
 
 # --- заметки ------------------------------------------------------------------
 
-def save_note(conn: sqlite3.Connection, user_id: int, text: str, today: str | None = None) -> str:
-    """Сохраняет заметку за сегодня и возвращает ответ ИИ-коуча (он тоже пишется в БД)."""
+def save_note(
+    conn: sqlite3.Connection,
+    user_id: int,
+    text: str,
+    today: str | None = None,
+    ai_enabled: bool = True,
+) -> str:
+    """Сохраняет заметку за сегодня и возвращает ответ ИИ-коуча (он тоже пишется в БД).
+
+    ``ai_enabled=False`` — ИИ-разбор выключен: заметка сохраняется с пустым
+    ``ai_text``, модель не вызывается (экономия лимитов; CONTRACT §18).
+    """
     day = today or calc.local_today()
-    data = collect(conn, int(user_id), "day", day)
-    data["notes"] = data["notes"] + [{"date": day, "text": text, "ai_text": ""}]
-    answer = ai_comment(data)
+    answer = ""
+    if ai_enabled:
+        data = collect(conn, int(user_id), "day", day, comment=False)
+        data["notes"] = data["notes"] + [{"date": day, "text": text, "ai_text": ""}]
+        answer = ai_comment(data)
     conn.execute(
         "INSERT INTO notes (user_id, date, text, ai_text) VALUES (?, ?, ?, ?)",
         (int(user_id), day, text[:2000], answer),

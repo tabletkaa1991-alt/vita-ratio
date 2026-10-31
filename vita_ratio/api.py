@@ -306,6 +306,7 @@ def _profile_json(profile: dict | None) -> dict | None:
         "sleep_bed": profile.get("sleep_bed"),
         "sleep_wake": profile.get("sleep_wake"),
         "reminders": bool(profile.get("reminders")),
+        "ai_enabled": bool(profile.get("ai_enabled")),
         "timezone": profile.get("timezone"),
         "goal_weight_kg": (
             _number(profile.get("goal_weight_kg"))
@@ -425,6 +426,19 @@ def _weight_json(row: dict | None) -> dict | None:
         "date": row["date"],
         "kg": _number(row.get("kg")),
         "note": row.get("note") or "",
+    }
+
+
+def _note_json(row: dict | None) -> dict | None:
+    """Заметка v4 -> JSON: ai_text пустая строка, если разбора ИИ не было."""
+    if not row:
+        return None
+    return {
+        "id": int(row["id"]),
+        "date": row["date"],
+        "text": row.get("text") or "",
+        "ai_text": row.get("ai_text") or "",
+        "created_at": row.get("created_at"),
     }
 
 
@@ -1175,6 +1189,59 @@ async def post_weight(request: web.Request) -> web.Response:
     )
 
 
+# --- заметки и ИИ (v4) ----------------------------------------------------------
+
+def _ai_enabled(profile: dict | None) -> bool:
+    """Флаг ИИ-разбора из профиля; без профиля — выключен."""
+    return bool(profile and profile.get("ai_enabled"))
+
+
+async def get_notes(request: web.Request) -> web.Response:
+    """Последние заметки (новые сверху) + текущее состояние ИИ-разбора."""
+    user = _user(request)
+    conn = _conn(request)
+    limit = _query_int(request, "limit", 30, 1, 100)
+    profile = store.get_profile(conn, user["id"])
+    return json_ok(
+        {
+            "notes": [_note_json(row) for row in store.list_notes(conn, user["id"], limit)],
+            "ai_enabled": _ai_enabled(profile),
+        }
+    )
+
+
+async def post_note(request: web.Request) -> web.Response:
+    """Сохраняет заметку за сегодня; ИИ-разбор только если включён в профиле."""
+    user = _user(request)
+    settings = _settings(request)
+    conn = _conn(request)
+    payload = await _body(request)
+    text = _text_value(payload.get("text"), "text", 2000, required=True)
+    profile = store.get_profile(conn, user["id"])
+    ai_enabled = _ai_enabled(profile)
+    today = calc.local_today(settings.timezone)
+    # Модель может думать до 20 с — не блокируем event loop.
+    await asyncio.to_thread(
+        reports.save_note, conn, user["id"], text, today, ai_enabled=ai_enabled
+    )
+    saved = store.list_notes(conn, user["id"], 1)
+    return json_ok(
+        {"note": _note_json(saved[0]) if saved else None, "ai_enabled": ai_enabled}
+    )
+
+
+async def put_ai(request: web.Request) -> web.Response:
+    """Включает/выключает ИИ-разбор заметок (флаг profiles.ai_enabled)."""
+    user = _user(request)
+    conn = _conn(request)
+    payload = await _body(request)
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        raise _bad("Поле «enabled» должно быть true или false")
+    profile = store.upsert_profile(conn, user["id"], {"ai_enabled": 1 if enabled else 0})
+    return json_ok({"ai_enabled": bool(profile.get("ai_enabled"))})
+
+
 # --- недельный чек-ин -----------------------------------------------------------
 
 def _feeling_value(value) -> str:
@@ -1448,6 +1515,7 @@ async def get_bootstrap(request: web.Request) -> web.Response:
         "user": _user_json(user),
         "profile": None,
         "targets": None,
+        "ai_enabled": _ai_enabled(profile),
         "goal": _goal_payload(
             conn, user["id"], profile, day, stats["trend_kg_per_week"]
         ),
@@ -1594,6 +1662,9 @@ def create_app(settings, conn) -> web.Application:
     app.router.add_put("/api/day/{item_id}", put_day)
     app.router.add_delete("/api/day/{item_id}", delete_day)
     app.router.add_post("/api/day/{item_id}/done", post_day_done)
+    app.router.add_get("/api/notes", get_notes)
+    app.router.add_post("/api/notes", post_note)
+    app.router.add_put("/api/ai", put_ai)
 
     app.router.add_get("/", index)
     app.router.add_get("/static/{name}", static_file)

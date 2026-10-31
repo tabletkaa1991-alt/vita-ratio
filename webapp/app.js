@@ -101,6 +101,8 @@
       daySuggestions: []
     },
     progress: { weights: null, stats: null, loading: false },
+    /* Заметки и ИИ (CONTRACT §20): отдельная загрузка, не блокирует «Прогресс». */
+    notes: { items: [], aiEnabled: false, loading: false, loaded: false, reload: false, saving: false, busy: false },
     theme: {
       accent: DEFAULT_THEME.accent,
       bg: DEFAULT_THEME.bg,
@@ -707,7 +709,10 @@
     if (tab === 'schedule' && !opts.noLoad) {
       setScheduleSegment(state.schedule.segment || 'day');
     }
-    if (tab === 'progress' && !opts.noLoad) { loadProgress(); }
+    if (tab === 'progress' && !opts.noLoad) {
+      loadProgress();
+      loadNotes();
+    }
   }
 
   /* ======================= bootstrap и профиль ======================= */
@@ -774,6 +779,7 @@
       renderProfileForm();
       renderPalette();
       if (state.progress.stats) { renderStats(); }
+      renderNotesToggle();
     }
     if (state.tab === 'schedule' && state.schedule.day) { renderDayPlan(); }
   }
@@ -3345,6 +3351,181 @@
     });
   }
 
+  /* ======================= «Прогресс»: заметки и ИИ (v4) ======================= */
+
+  var NOTE_MAX_LENGTH = 2000;
+
+  function flagOn(value) {
+    return value === true || value === 1 || value === '1' || value === 'true';
+  }
+
+  /* Источник правды — state.bootstrap.profile.ai_enabled (CONTRACT §20):
+     нет поля / нет профиля → выключено. GET /api/notes, PUT /api/ai и
+     POST /api/notes синхронизируют флаг через setAiEnabled(). */
+  function aiEnabledNow() {
+    var profile = currentProfile();
+    if (!profile) { return !!state.notes.aiEnabled; }
+    return flagOn(profile.ai_enabled);
+  }
+
+  function setAiEnabled(enabled) {
+    var value = !!enabled;
+    state.notes.aiEnabled = value;
+    var profile = currentProfile();
+    if (profile) { profile.ai_enabled = value; }
+  }
+
+  function renderNotesToggle() {
+    var enabled = aiEnabledNow();
+    var toggle = byId('ai-toggle');
+    var label = byId('ai-toggle-label');
+    var hint = byId('ai-toggle-hint');
+    var plaque = byId('notes-ai-off');
+    if (toggle) {
+      toggle.setAttribute('aria-checked', enabled ? 'true' : 'false');
+      toggle.disabled = !!state.notes.busy;
+      toggle.classList.toggle('is-busy', !!state.notes.busy);
+    }
+    if (label) {
+      label.textContent = enabled ? 'ИИ включён' : 'Включить ИИ';
+      label.classList.toggle('is-on', enabled);
+      label.classList.toggle('is-off', !enabled);
+    }
+    if (hint) { hint.hidden = enabled; }
+    if (plaque) { plaque.hidden = enabled; }
+  }
+
+  function noteDateText(note) {
+    var iso = String((note && (note.date || note.created_at)) || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) { return ''; }
+    return dateShort(iso);
+  }
+
+  function noteItemHtml(note) {
+    var dateText = noteDateText(note);
+    var aiText = String((note && note.ai_text) || '').trim();
+    return '<li class="note-item">' +
+      (dateText ? '<span class="note-item__date">' + esc(dateText) + '</span>' : '') +
+      '<p class="note-item__text">' + esc((note && note.text) || '') + '</p>' +
+      (aiText ? '<p class="note-item__ai">🤖 ' + esc(aiText) + '</p>' : '') +
+    '</li>';
+  }
+
+  function renderNotes() {
+    var list = byId('notes-list');
+    var empty = byId('notes-empty');
+    if (!list || !empty) { return; }
+    var items = state.notes.items || [];
+    if (!items.length) {
+      list.innerHTML = '';
+      if (state.notes.loading) {
+        empty.textContent = 'Загружаю заметки…';
+      } else if (state.notes.loaded) {
+        empty.textContent = 'Заметок пока нет — добавь первую.';
+      } else {
+        empty.textContent = 'Заметки не загрузились — попробуй позже.';
+      }
+      empty.hidden = false;
+      renderNotesToggle();
+      return;
+    }
+    empty.hidden = true;
+    list.innerHTML = items.map(noteItemHtml).join('');
+    renderNotesToggle();
+  }
+
+  /* Список грузится отдельным запросом: медленный /api/notes не держит
+     графики и профиль, а ошибка остаётся тихой (без тоста). */
+  function loadNotes() {
+    if (state.notes.loading) {
+      state.notes.reload = true;
+      return;
+    }
+    state.notes.loading = true;
+    renderNotes();
+    apiRequest('GET', '/api/notes?limit=30').then(function (data) {
+      state.notes.loading = false;
+      state.notes.loaded = true;
+      state.notes.items = ((data && data.notes) || []).slice(0, 30);
+      if (data && typeof data.ai_enabled === 'boolean') { setAiEnabled(data.ai_enabled); }
+      renderNotes();
+      if (state.notes.reload) {
+        state.notes.reload = false;
+        loadNotes();
+      }
+    }).catch(function () {
+      state.notes.loading = false;
+      if (!state.notes.loaded) { state.notes.items = []; }
+      renderNotes();
+      if (state.notes.reload) {
+        state.notes.reload = false;
+        loadNotes();
+      }
+    });
+  }
+
+  function toggleAi() {
+    if (state.notes.busy) { return; }
+    var next = !aiEnabledNow();
+    state.notes.busy = true;
+    renderNotesToggle();
+    haptic('select');
+    apiRequest('PUT', '/api/ai', { enabled: next }).then(function (data) {
+      state.notes.busy = false;
+      var enabled = data && typeof data.ai_enabled === 'boolean' ? data.ai_enabled : next;
+      setAiEnabled(enabled);
+      renderNotesToggle();
+      haptic('success');
+      toast(enabled ? 'ИИ включён — новые заметки получат разбор' : 'ИИ-разбор заметок выключен');
+    }).catch(function (error) {
+      state.notes.busy = false;
+      renderNotesToggle();
+      haptic('error');
+      var code = error && error.code;
+      toast(code === 'http_404' || code === 'not_found'
+        ? 'ИИ пока недоступен — попробуй позже.'
+        : errorText(code), 'error');
+    });
+  }
+
+  function submitNote(event) {
+    event.preventDefault();
+    if (state.notes.saving) { return; }
+    var input = byId('note-text');
+    var text = String(input ? input.value : '').trim();
+    if (!text) {
+      toast('Напиши текст заметки', 'error');
+      haptic('error');
+      if (input) { try { input.focus(); } catch (error) { /* noop */ } }
+      return;
+    }
+    if (text.length > NOTE_MAX_LENGTH) {
+      toast('Заметка — до ' + NOTE_MAX_LENGTH + ' символов', 'error');
+      haptic('error');
+      return;
+    }
+    var button = byId('note-submit');
+    state.notes.saving = true;
+    setBusy(button, true);
+    apiRequest('POST', '/api/notes', { text: text }).then(function (data) {
+      state.notes.saving = false;
+      setBusy(button, false);
+      haptic('success');
+      if (data && typeof data.ai_enabled === 'boolean') { setAiEnabled(data.ai_enabled); }
+      if (input) { input.value = ''; }
+      toast('Заметка сохранена');
+      loadNotes();
+    }).catch(function (error) {
+      state.notes.saving = false;
+      setBusy(button, false);
+      haptic('error');
+      var code = error && error.code;
+      toast(code === 'http_404' || code === 'not_found'
+        ? 'Заметки пока недоступны — попробуй позже.'
+        : errorText(code), 'error'); /* поле не очищаем — текст не теряется */
+    });
+  }
+
   /* ======================= онбординг ======================= */
 
   function showOnboarding() {
@@ -3737,6 +3918,9 @@
       byId(id).addEventListener('input', applyThemeFromInputs);
     });
     byId('btn-theme-reset').addEventListener('click', resetTheme);
+    // Заметки и ИИ (v4): подпись внутри кнопки, клик по ней — тот же тумблер
+    byId('ai-toggle').addEventListener('click', toggleAi);
+    byId('note-form').addEventListener('submit', submitNote);
 
     // Онбординг
     byId('onb-next').addEventListener('click', function () { goOnbStep(1); });

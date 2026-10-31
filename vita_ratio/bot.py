@@ -777,11 +777,24 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
         if not text:
             await message.answer("✍️ Напиши так: <code>/note сегодня тяжело, мало спал</code>")
             return
+        user_id = user_id_of(message)
         try:
-            reply = await asyncio.to_thread(reports.save_note, conn, user_id_of(message), text)
+            profile = get_profile(conn, user_id)
+            ai_enabled = profile is not None and int(_dget(profile, "ai_enabled", 0) or 0) == 1
+            reply = await asyncio.to_thread(
+                reports.save_note, conn, user_id, text, None, ai_enabled
+            )
         except Exception:
-            log.exception("Ошибка /note для user_id=%s", user_id_of(message))
+            log.exception("Ошибка /note для user_id=%s", user_id)
             await message.answer("😔 Не получилось сохранить заметку. Попробуй ещё раз чуть позже.")
+            return
+        if profile is not None and not ai_enabled:
+            # ИИ-разбор выключен в профиле: заметка сохранена, модель не вызывалась.
+            await answer(
+                message,
+                "📝 Заметка сохранена. ИИ-разбор выключен — включи в приложении: "
+                "Прогресс → Заметки и ИИ",
+            )
             return
         await answer(message, "📝 <b>Заметка сохранена.</b>\n\n🤖 <b>ИИ-разбор:</b>\n" + _esc(reply))
 

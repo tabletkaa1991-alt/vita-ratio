@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS profiles (
     timezone       TEXT    NOT NULL DEFAULT 'Europe/Moscow',
     goal_weight_kg REAL,
     goal_date      TEXT,
+    ai_enabled     INTEGER NOT NULL DEFAULT 0,  -- ИИ-разбор заметок (потом можно закрыть оплатой)
     theme_accent   TEXT    NOT NULL DEFAULT '#B7F75C',
     theme_bg       TEXT    NOT NULL DEFAULT '#0E1116',
     theme_card     TEXT    NOT NULL DEFAULT '#151A21',

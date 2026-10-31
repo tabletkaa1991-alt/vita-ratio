@@ -693,6 +693,32 @@
             </div>
           </article>
 
+          <article id="notes-card" class="card" aria-label="Заметки и ИИ">
+            <div class="card__head">
+              <p class="card__label">Заметки и ИИ</p>
+              <span class="muted">до 30 последних</span>
+            </div>
+            <button type="button" id="ai-toggle" class="ai-toggle" role="switch" aria-checked="false"
+                    aria-describedby="ai-toggle-hint">
+              <span class="ai-toggle__track" aria-hidden="true"><span class="ai-toggle__thumb"></span></span>
+              <span id="ai-toggle-label" class="ai-toggle__label">Включить ИИ</span>
+            </button>
+            <p id="ai-toggle-hint" class="ai-toggle__hint" hidden>ИИ-разбор заметок выключен</p>
+
+            <form id="note-form" class="form form--inline note-form" novalidate>
+              <div class="field">
+                <label for="note-text">Новая заметка</label>
+                <textarea id="note-text" maxlength="2000" rows="3"
+                          placeholder="Что съел, как спал, как прошла тренировка…"></textarea>
+              </div>
+              <button type="submit" id="note-submit" class="btn btn--accent btn--wide">Сохранить заметку</button>
+            </form>
+
+            <p id="notes-ai-off" class="note-flag" hidden>ИИ выключен</p>
+            <ul id="notes-list" class="notes-list"></ul>
+            <p id="notes-empty" class="empty" hidden>Заметок пока нет — добавь первую.</p>
+          </article>
+
           <article class="card" aria-label="Профиль и цели">
             <div class="card__head">
               <p class="card__label">Профиль</p>

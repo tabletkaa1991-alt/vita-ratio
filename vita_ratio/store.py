@@ -26,6 +26,7 @@ PROFILE_FIELDS = (
     "sleep_bed",
     "sleep_wake",
     "reminders",
+    "ai_enabled",
     "timezone",
     "goal_weight_kg",
     "goal_date",
@@ -61,6 +62,7 @@ _PROFILE_DEFAULTS = {
     "sleep_bed": "23:00",
     "sleep_wake": "07:00",
     "reminders": 1,
+    "ai_enabled": 0,
     "timezone": "Europe/Moscow",
     "goal_weight_kg": None,
     "goal_date": None,
@@ -153,6 +155,7 @@ def upsert_profile(conn: sqlite3.Connection, user_id: int, data: dict) -> dict:
     for field, default in _PROFILE_DEFAULTS.items():
         values.setdefault(field, default)
     values["reminders"] = _as_flag(values["reminders"])
+    values["ai_enabled"] = _as_flag(values["ai_enabled"])
 
     columns = ["user_id", *PROFILE_FIELDS, "updated_at"]
     params = [uid, *[values[field] for field in PROFILE_FIELDS], _now_iso()]
@@ -497,6 +500,28 @@ def list_weekly_checkins(conn: sqlite3.Connection, user_id: int, limit: int = 12
     return _rows(
         conn.execute(
             "SELECT * FROM weekly_checkins WHERE user_id = ? ORDER BY week_start DESC LIMIT ?",
+            (int(user_id), max(int(limit), 1)),
+        )
+    )
+
+
+# --- заметки -------------------------------------------------------------------
+
+def list_notes(conn: sqlite3.Connection, user_id: int, limit: int = 30) -> list[dict]:
+    """Заметки пользователя по убыванию id (новые сверху), до ``limit`` штук.
+
+    Каждая запись: ``{"id", "date", "text", "ai_text", "created_at"}``;
+    ``ai_text`` пустая строка, если ИИ-разбора не было (флаг ai_enabled выключен).
+    """
+    return _rows(
+        conn.execute(
+            """
+            SELECT id, date, text, ai_text, created_at
+            FROM notes
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
             (int(user_id), max(int(limit), 1)),
         )
     )
