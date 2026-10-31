@@ -109,19 +109,15 @@ def is_ai_available(
     profile: Any = None,
     today: str | None = None,
 ) -> bool:
-    """Доступен ли пользователю ИИ (free / оплаченный или промо-аддон ``ai_until``).
+    """Доступен ли пользователю ИИ (CONTRACT §37–38).
 
-    Логика та же, что у ``effective_ai`` в API и боте: бесплатный доступ
-    (CONTRACT §29) включает ИИ всегда; иначе нужен флаг ``ai_enabled=1`` и
-    ``ai_until >= today`` (дата включительно). Промо-триал ИИ работает через
-    тот же ``ai_until``, который выставляется при создании профиля, если задан
-    ``AI_TRIAL_DAYS``. Ошибки чтения БД -> ``False`` (гейт не роняем).
+    Порядок проверок: сначала профиль (переданный или из БД), затем флаг
+    ``ai_enabled=1``, затем срок: бесплатный доступ (§29) или
+    ``ai_until >= today`` (дата включительно). Для free-пользователя флаг тоже
+    уважается: выключил тумблер — ИИ недоступен, включил — доступен.
+    Профиля нет/ошибка чтения -> ``False``. Промо-триал ИИ работает через тот
+    же ``ai_until``, который выставляется при создании профиля (``AI_TRIAL_DAYS``).
     """
-    try:
-        if access.is_free(settings_obj, user_id=user_id, username=username, conn=conn):
-            return True
-    except Exception:  # noqa: BLE001 — whitelist не должен ронять гейт
-        log.exception("ai: не удалось проверить бесплатный доступ")
     if profile is None and conn is not None and user_id is not None:
         try:
             profile = store.get_profile(conn, int(user_id))
@@ -136,6 +132,15 @@ def is_ai_available(
         enabled = False
     if not enabled:
         return False
+    try:
+        free = bool(
+            access.is_free(settings_obj, user_id=user_id, username=username, conn=conn)
+        )
+    except Exception:  # noqa: BLE001 — whitelist не должен ронять гейт
+        log.exception("ai: не удалось проверить бесплатный доступ")
+        free = False
+    if free:
+        return True
     if today is None:
         timezone = getattr(settings_obj, "timezone", None) or DEFAULT_TIMEZONE
         today = calc.local_today(timezone)

@@ -1587,9 +1587,9 @@ svg {
   max-width: var(--maxw);
   margin: 0 auto;
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 1px;
-  padding: 6px 6px calc(6px + env(safe-area-inset-bottom, 0px));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 0;
+  padding: 6px 3px calc(6px + env(safe-area-inset-bottom, 0px));
   background: rgba(var(--bg-rgb), 0.94);
   border-top: 1px solid var(--border);
   backdrop-filter: blur(20px);
@@ -1601,17 +1601,17 @@ svg {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 3px;
+  gap: 2px;
   min-width: 0;
   min-height: 48px;
-  padding: 4px 1px;
+  padding: 4px 0;
   border: none;
   border-radius: 12px;
   background: transparent;
   color: var(--muted);
-  font-size: 9px;
+  font-size: 8.5px;
   font-weight: 600;
-  letter-spacing: 0;
+  letter-spacing: -0.01em;
   line-height: 1.1;
   text-align: center;
   overflow: hidden;
@@ -1621,8 +1621,8 @@ svg {
 
 .tab svg {
   flex: none;
-  width: 21px;
-  height: 21px;
+  width: 20px;
+  height: 20px;
   fill: none;
   stroke: currentColor;
   stroke-width: 1.7;
@@ -1862,12 +1862,12 @@ svg {
   }
 
   .tab {
-    font-size: 8.5px;
+    font-size: 8px;
   }
 
   .tab svg {
-    width: 20px;
-    height: 20px;
+    width: 19px;
+    height: 19px;
   }
 
   .ring-wrap {
@@ -1904,12 +1904,12 @@ svg {
   }
 
   .tab {
-    font-size: 8px;
+    font-size: 7.5px;
   }
 
   .tab svg {
-    width: 19px;
-    height: 19px;
+    width: 18px;
+    height: 18px;
   }
 }
 
@@ -3239,5 +3239,117 @@ body.paywall-open {
   .paywall__price-main {
     font-size: 29px;
   }
+}
+
+/* ==========================================================================
+   НАСТРОЙКИ (CONTRACT §36–37): профиль, цветокоррекция, подписка и ИИ-аддон
+   ========================================================================== */
+
+/* Карточки настроек идут стопкой, профиль и палитра перенесены сюда. */
+#screen-settings .profile-summary {
+  margin-bottom: 10px;
+}
+
+#screen-settings .subscription-status {
+  margin: 0 0 14px;
+}
+
+/* ---------- ИИ-аддон: строка с тумблером ---------- */
+
+.ai-plan-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.ai-plan-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.ai-plan-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.ai-plan-status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.ai-plan-toggle {
+  position: relative;
+  flex: none;
+  width: 52px;
+  height: 30px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.10);
+  transition: background 0.18s, border-color 0.18s, opacity 0.18s;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.ai-plan-toggle__knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: left 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
+}
+
+.ai-plan-toggle.is-on {
+  border-color: var(--border);
+  background: var(--accent-soft);
+}
+
+.ai-plan-toggle.is-on .ai-plan-toggle__knob {
+  left: calc(100% - 25px);
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.16);
+}
+
+.ai-plan-toggle:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.ai-plan-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---------- модалка оплаты ИИ-аддона из настроек ---------- */
+
+.ai-plan-paywall {
+  z-index: 160;
+}
+
+.ai-plan-paywall__panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ai-plan-paywall__panel .paywall__price {
+  margin: 2px 0;
+}
+
+.ai-plan-paywall__panel .btn {
+  width: 100%;
 }
 

@@ -112,7 +112,7 @@
     },
     /* Подписка (CONTRACT §22–25): GET /api/subscription + bootstrap.subscription. */
     subscription: { data: null, loading: false, loaded: false, reload: false, missing: false },
-    pay: { baseBusy: false, aiBusy: false, forcePaywall: false },
+    pay: { baseBusy: false, aiBusy: false, aiToggleBusy: false, forcePaywall: false },
     theme: {
       accent: DEFAULT_THEME.accent,
       bg: DEFAULT_THEME.bg,
@@ -728,6 +728,11 @@
       loadAiHistory();
       loadSubscription();
     }
+    if (tab === 'settings' && !opts.noLoad) {
+      /* Настройки: профиль, палитра и тумблер ИИ-аддона. */
+      renderSettings();
+      loadSubscription();
+    }
   }
 
   /* ======================= bootstrap и профиль ======================= */
@@ -800,9 +805,12 @@
       renderSleepSync();
     }
     if (state.tab === 'progress') {
+      if (state.progress.stats) { renderStats(); }
+    }
+    if (state.tab === 'settings') {
       renderProfileForm();
       renderPalette();
-      if (state.progress.stats) { renderStats(); }
+      renderAiPlan(subscriptionPayload());
     }
     if (state.tab === 'ai') { renderAiScreen(); }
     if (state.tab === 'schedule' && state.schedule.day) { renderDayPlan(); }
@@ -832,7 +840,8 @@
     ai_price_stars: 60,
     period_days: 30,
     trial_days: 7,
-    enforced: false
+    enforced: false,
+    free: false
   };
 
   function normalizeSubscription(raw) {
@@ -845,6 +854,7 @@
     out.ai_active = flagOn(raw.ai_active);
     out.ai_enabled = flagOn(raw.ai_enabled);
     out.enforced = flagOn(raw.enforced);
+    out.free = flagOn(raw.free);
     out.base_price_rub = Math.max(1, int(raw.base_price_rub, 250));
     out.base_price_stars = Math.max(1, int(raw.base_price_stars, 150));
     out.ai_price_rub = Math.max(1, int(raw.ai_price_rub, 100));
@@ -875,6 +885,7 @@
 
   function subscriptionStatusText(sub) {
     if (!sub) { return ''; }
+    if (sub.free) { return 'Бесплатный доступ'; }
     var until = sub.trial_until || sub.until;
     if (sub.active) {
       if (!until) { return subscriptionIsTrial(sub) ? 'Пробный период активен' : 'Подписка активна'; }
@@ -890,11 +901,18 @@
     return !!(sub && sub.active !== true && sub.enforced === true);
   }
 
+  function syncPaywallLock() {
+    var subNode = byId('sub-paywall');
+    var planNode = byId('ai-plan-paywall');
+    var locked = !!(subNode && !subNode.hidden) || !!(planNode && !planNode.hidden);
+    document.body.classList.toggle('paywall-open', locked);
+  }
+
   function setPaywallVisible(visible) {
     var node = byId('sub-paywall');
     if (!node) { return; }
     node.hidden = !visible;
-    document.body.classList.toggle('paywall-open', !!visible);
+    syncPaywallLock();
   }
 
   function renderPaywall(sub) {
@@ -945,6 +963,8 @@
     }
     renderPaywall(sub);
     renderSubscriptionStatus(sub);
+    /* Тумблер ИИ-аддона на экране «Настройки» живёт на тех же данных. */
+    renderAiPlan(sub);
     /* Экран ИИ сам решает, показать поле ввода или плашку +100 ₽/мес. */
     renderAiScreen();
   }
@@ -962,10 +982,14 @@
       state.subscription.missing = false;
       var normalized = normalizeSubscription(data);
       state.subscription.data = normalized;
-      /* Оплатили/получили аддон — снимаем принудительный paywall экрана ИИ. */
-      if (normalized && normalized.ai_active === true) {
-        state.aiChat.forcePaywall = false;
-        state.aiChat.active = true;
+      /* Эффективный ИИ (флаг И аддон) — источник правды и для экрана ИИ,
+         и для тумблера в настройках. Оплаченный, но выключенный аддон
+         не должен оставлять поле ввода на экране «ИИ». */
+      if (normalized) {
+        state.aiChat.active = normalized.ai_enabled === true;
+        if (normalized.ai_enabled === true) {
+          state.aiChat.forcePaywall = false;
+        }
       }
       renderSubscription();
       if (state.subscription.reload) {
@@ -1048,11 +1072,13 @@
       /* ошибку не показываем — статус всё равно перечитаем ниже */
     }).then(function () {
       afterPaymentRefresh();
+      /* Вернулись с оплаты аддона (?paid=ai) — дожимаем флаг ИИ. */
+      if (kind === 'ai') { enableAiPlanAfterPayment(); }
     });
   }
 
-  function showInvoiceHint(kind, url) {
-    var node = kind === 'ai' ? byId('ai-paywall-note') : byId('sub-pay-note');
+  function showInvoiceHint(kind, url, noteId) {
+    var node = byId(noteId || (kind === 'ai' ? 'ai-paywall-note' : 'sub-pay-note'));
     if (!node) { return; }
     var prefix = kind === 'ai' ? 'Подключить ИИ можно в Telegram:' : 'Оплатить можно в Telegram:';
     node.innerHTML = esc(prefix) + ' <a href="' + esc(url) +
@@ -1060,8 +1086,8 @@
     node.hidden = false;
   }
 
-  function hideInvoiceHint(kind) {
-    var node = kind === 'ai' ? byId('ai-paywall-note') : byId('sub-pay-note');
+  function hideInvoiceHint(kind, noteId) {
+    var node = byId(noteId || (kind === 'ai' ? 'ai-paywall-note' : 'sub-pay-note'));
     if (node) {
       node.textContent = '';
       node.hidden = true;
@@ -1073,16 +1099,36 @@
     loadSubscription({ force: true });
   }
 
+  /* После оплаты аддона backend выставляет ai_until; флаг ai_enabled
+     подтверждаем явным PUT /api/ai {enabled:true} (CONTRACT §36–37). */
+  function enableAiPlanAfterPayment() {
+    apiRequest('PUT', '/api/ai', { enabled: true }).then(function (data) {
+      var sub = subscriptionPayload();
+      if (sub && data && data.ai_enabled === true) {
+        sub.ai_enabled = true;
+        sub.ai_active = true;
+      }
+      state.aiChat.forcePaywall = false;
+      renderAiPlan(subscriptionPayload());
+      loadSubscription({ force: true });
+    }).catch(function () {
+      /* Вебхук мог ещё не дойти: статус обновит ближайший GET /api/subscription. */
+      loadSubscription({ force: true });
+    });
+  }
+
   function handleInvoiceStatus(kind, status) {
     if (status === 'paid') {
       haptic('success');
       if (kind === 'ai') {
         /* Оплатили аддон — сразу открываем чат, дальше подписка/история уточнят статус. */
+        closeAiPlanPaywall();
         state.aiChat.forcePaywall = false;
         state.aiChat.active = true;
         renderAiScreen();
         toast('ИИ-ассистент подключён');
         afterPaymentRefresh();
+        enableAiPlanAfterPayment();
         loadAiHistory();
         return;
       }
@@ -1143,12 +1189,16 @@
     });
   }
 
-  function payAi() {
+  /* Общая оплата ИИ-аддона: экран «ИИ» (#ai-subscribe-btn) и
+     модалка из «Настроек» (#ai-plan-pay-btn) используют kind=ai. */
+  function payAiAddon(options) {
+    var opts = options || {};
     if (state.pay.aiBusy) { return; }
-    var button = byId('ai-subscribe-btn');
+    var button = byId(opts.buttonId || 'ai-subscribe-btn');
+    var noteId = opts.noteId || 'ai-paywall-note';
     state.pay.aiBusy = true;
     setBusy(button, true);
-    hideInvoiceHint('ai');
+    hideInvoiceHint('ai', noteId);
     haptic('select');
     requestInvoice('ai').then(function (data) {
       state.pay.aiBusy = false;
@@ -1163,7 +1213,7 @@
         handleInvoiceStatus('ai', status);
       });
       if (!opened) {
-        showInvoiceHint('ai', data.invoice_url);
+        showInvoiceHint('ai', data.invoice_url, noteId);
         toast('Готово: подключи ИИ в Telegram');
       }
     }).catch(function (error) {
@@ -1180,6 +1230,137 @@
       }
       if (code === 'subscription_required' || code === 'http_402') { loadSubscription(); }
       toast(invoiceErrorText(code), 'error');
+    });
+  }
+
+  function payAi() {
+    payAiAddon();
+  }
+
+  function payAiPlan() {
+    payAiAddon({ buttonId: 'ai-plan-pay-btn', noteId: 'ai-plan-pay-note' });
+  }
+
+  /* ======================= экран «Настройки» (CONTRACT §36–37) ======================= */
+
+  /* Единый рендер тумблера ИИ-аддона. Источник данных — /api/subscription:
+     ai_active — оплаченный/промо-период, ai_enabled — эффективный флаг ИИ. */
+  function renderAiPlan(sub) {
+    var data = sub || subscriptionPayload();
+    var toggle = byId('ai-plan-toggle');
+    var status = byId('ai-plan-status');
+    var priceNode = byId('ai-plan-paywall-price');
+    var starsNode = byId('ai-plan-paywall-stars');
+    var payButton = byId('ai-plan-pay-btn');
+    var rub = data ? data.ai_price_rub : SUBSCRIPTION_DEFAULTS.ai_price_rub;
+    var stars = data ? data.ai_price_stars : SUBSCRIPTION_DEFAULTS.ai_price_stars;
+    var addonActive = !!(data && data.ai_active === true);
+    var enabled = addonActive && data.ai_enabled === true;
+
+    if (priceNode) { priceNode.textContent = fmtInt(rub); }
+    if (starsNode) { starsNode.textContent = fmtInt(stars); }
+    if (payButton) { payButton.textContent = 'Оплатить ' + fmtInt(rub) + ' ₽'; }
+    if (toggle) {
+      toggle.classList.toggle('is-on', enabled);
+      toggle.setAttribute('aria-checked', enabled ? 'true' : 'false');
+      toggle.setAttribute('aria-label', enabled ? 'Выключить ИИ-аддон' : 'Включить ИИ-аддон');
+      setBusy(toggle, !!state.pay.aiToggleBusy);
+    }
+    if (!status) { return; }
+
+    if (addonActive) {
+      if (!enabled) {
+        status.textContent = 'ИИ выключен';
+        return;
+      }
+      status.textContent = data.ai_until
+        ? 'ИИ включён · до ' + dateShort(data.ai_until)
+        : 'ИИ включён';
+      return;
+    }
+    status.textContent = 'ИИ ' + aiPriceLabel(data);
+  }
+
+  function renderSettings() {
+    renderProfileForm();
+    renderPalette();
+    renderSubscriptionStatus(subscriptionPayload());
+    renderAiPlan(subscriptionPayload());
+    loadTheme();
+  }
+
+  function openAiPlanPaywall() {
+    var node = byId('ai-plan-paywall');
+    if (!node) { return; }
+    renderAiPlan(subscriptionPayload());
+    node.hidden = false;
+    syncPaywallLock();
+    document.addEventListener('keydown', onAiPlanPaywallKeydown);
+    haptic('select');
+  }
+
+  function closeAiPlanPaywall() {
+    var node = byId('ai-plan-paywall');
+    if (!node) { return; }
+    node.hidden = true;
+    document.removeEventListener('keydown', onAiPlanPaywallKeydown);
+    syncPaywallLock();
+  }
+
+  function onAiPlanPaywallKeydown(event) {
+    if (event.key === 'Escape') { closeAiPlanPaywall(); }
+  }
+
+  /* Тумблер: выключение -> PUT false (всегда 200); включение -> PUT true.
+     При активном аддоне 200, окно оплаты НЕ показываем. Если аддона нет,
+     backend отвечает 402 ai_subscription_required (или 200 с ai_enabled=false
+     в dev-режиме) — тогда открываем модалку оплаты ИИ-аддона. */
+  function onAiPlanToggle() {
+    if (state.pay.aiToggleBusy) { return; }
+    var sub = subscriptionPayload();
+    var addonActive = !!(sub && sub.ai_active === true);
+    var enabled = addonActive && sub.ai_enabled === true;
+    state.pay.aiToggleBusy = true;
+    renderAiPlan(sub);
+    haptic('select');
+
+    apiRequest('PUT', '/api/ai', { enabled: !enabled }).then(function (data) {
+      state.pay.aiToggleBusy = false;
+      if (enabled) {
+        /* Выключение: оплаченный период сохраняется, ИИ просто не работает. */
+        var offSub = subscriptionPayload();
+        if (offSub) { offSub.ai_enabled = false; }
+        renderAiPlan(offSub);
+        haptic('success');
+        toast('ИИ выключен');
+        loadSubscription({ force: true });
+        return;
+      }
+      if (data && data.ai_enabled === true) {
+        /* Аддон уже активен — повторное включение без окна оплаты. */
+        var onSub = subscriptionPayload();
+        if (onSub) {
+          onSub.ai_enabled = true;
+          onSub.ai_active = true;
+        }
+        renderAiPlan(onSub);
+        haptic('success');
+        toast('ИИ включён');
+        loadSubscription({ force: true });
+        return;
+      }
+      openAiPlanPaywall();
+    }).catch(function (error) {
+      state.pay.aiToggleBusy = false;
+      renderAiPlan(subscriptionPayload());
+      var code = error && error.code;
+      if (code === 'ai_subscription_required' || code === 'http_402') {
+        loadSubscription({ force: true });
+        openAiPlanPaywall();
+        return;
+      }
+      haptic('error');
+      toast(errorText(code), 'error');
     });
   }
 
@@ -3351,9 +3532,6 @@
       setScreenLoading('progress', false);
       renderWeights();
       renderStats();
-      renderProfileForm();
-      renderPalette();
-      loadTheme();
       if (!byId('weight-date').value) { byId('weight-date').value = todayIso(); }
     }).catch(function (error) {
       state.progress.loading = false;
@@ -4404,6 +4582,14 @@
     // Подписка (v5): блокирующий paywall и аддон ИИ
     byId('sub-pay-btn').addEventListener('click', payBase);
     byId('ai-subscribe-btn').addEventListener('click', payAi);
+
+    // Настройки (CONTRACT §36–37): тумблер и модалка оплаты ИИ-аддона
+    byId('ai-plan-toggle').addEventListener('click', onAiPlanToggle);
+    byId('ai-plan-pay-btn').addEventListener('click', payAiPlan);
+    byId('ai-plan-pay-cancel').addEventListener('click', closeAiPlanPaywall);
+    byId('ai-plan-paywall').addEventListener('click', function (event) {
+      if (event.target === byId('ai-plan-paywall')) { closeAiPlanPaywall(); }
+    });
 
     // Онбординг
     byId('onb-next').addEventListener('click', function () { goOnbStep(1); });

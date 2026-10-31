@@ -693,9 +693,58 @@
             </div>
           </article>
 
-          <!-- Чат с ИИ-ассистентом вынесен на отдельный экран «ИИ» (v8). -->
-          <p id="subscription-status" class="subscription-status" hidden></p>
+          <!-- Профиль, палитра и статус подписки перенесены в «Настройки» (CONTRACT §36–37). -->
+        </div>
+      </section>
 
+      <!-- ==================== ИИ ==================== -->
+      <section id="screen-ai" class="screen" data-screen="ai" aria-labelledby="ai-title">
+        <header class="screen-head ai-head">
+          <div>
+            <p class="eyebrow">Ассистент</p>
+            <h1 id="ai-title" class="title title--sm">ИИ-ассистент</h1>
+          </div>
+          <p id="ai-screen-status" class="ai-screen-status" aria-live="polite">ИИ +100 ₽/мес</p>
+        </header>
+
+        <div id="ai-content" class="screen-content ai-content">
+          <!-- Paywall ИИ-аддона: показывается вместо поля ввода, если ai_active=false (CONTRACT §25). -->
+          <article id="ai-paywall" class="card ai-paywall" aria-label="Подключение ИИ" hidden>
+            <div class="card__head">
+              <p class="card__label">ИИ-ассистент</p>
+              <span id="ai-paywall-price" class="ai-paywall__price">+100 ₽/мес</span>
+            </div>
+            <p id="ai-paywall-text" class="muted">ИИ-ассистент отвечает на любые вопросы: учёба, тренировки, еда, код, что угодно.</p>
+            <button type="button" id="ai-subscribe-btn" class="btn btn--accent btn--wide">Подключить ИИ · +100 ₽/мес</button>
+            <p id="ai-paywall-note" class="ai-paywall__note" hidden></p>
+          </article>
+
+          <div class="ai-chat">
+            <ul id="ai-chat-list" class="ai-chat-list" aria-live="polite"></ul>
+            <p id="ai-chat-empty" class="empty">Задай любой вопрос — я помогу: учёба, тренировки, еда, код, что угодно.</p>
+            <p id="ai-typing" class="ai-typing" hidden>🤖 ИИ печатает…</p>
+          </div>
+        </div>
+
+        <!-- Ввод закреплён снизу над таб-баром, отступ учитывает safe-area. -->
+        <form id="ai-composer" class="ai-composer" novalidate hidden>
+          <label class="visually-hidden" for="ai-input">Сообщение ИИ-ассистенту</label>
+          <textarea id="ai-input" maxlength="2000" rows="1"
+                    placeholder="Спроси что угодно…"></textarea>
+          <button type="submit" id="ai-send" class="btn btn--accent ai-send">Отправить</button>
+        </form>
+      </section>
+
+      <!-- ==================== НАСТРОЙКИ ==================== -->
+      <section id="screen-settings" class="screen" data-screen="settings" aria-labelledby="settings-title">
+        <header class="screen-head">
+          <div>
+            <p class="eyebrow">Приложение</p>
+            <h1 id="settings-title" class="title title--sm">Настройки</h1>
+          </div>
+        </header>
+
+        <div id="settings-content" class="screen-content">
           <article class="card" aria-label="Профиль и цели">
             <div class="card__head">
               <p class="card__label">Профиль</p>
@@ -755,9 +804,9 @@
             </form>
           </article>
 
-          <article class="card" aria-label="Оформление">
+          <article class="card" aria-label="Цветокоррекция">
             <div class="card__head">
-              <p class="card__label">Оформление</p>
+              <p class="card__label">Цветокоррекция</p>
               <span id="theme-status" class="muted">палитра · lime</span>
             </div>
             <div id="palette-presets" class="palette-grid" role="group" aria-label="Пресеты палитры"></div>
@@ -777,45 +826,26 @@
             </div>
             <button type="button" id="btn-theme-reset" class="btn btn--ghost btn--wide">Сбросить</button>
           </article>
-        </div>
-      </section>
 
-      <!-- ==================== ИИ ==================== -->
-      <section id="screen-ai" class="screen" data-screen="ai" aria-labelledby="ai-title">
-        <header class="screen-head ai-head">
-          <div>
-            <p class="eyebrow">Ассистент</p>
-            <h1 id="ai-title" class="title title--sm">ИИ-ассистент</h1>
-          </div>
-          <p id="ai-screen-status" class="ai-screen-status" aria-live="polite">ИИ +100 ₽/мес</p>
-        </header>
-
-        <div id="ai-content" class="screen-content ai-content">
-          <!-- Paywall ИИ-аддона: показывается вместо поля ввода, если ai_active=false (CONTRACT §25). -->
-          <article id="ai-paywall" class="card ai-paywall" aria-label="Подключение ИИ" hidden>
+          <article class="card" aria-label="Подписка и ИИ-аддон">
             <div class="card__head">
-              <p class="card__label">ИИ-ассистент</p>
-              <span id="ai-paywall-price" class="ai-paywall__price">+100 ₽/мес</span>
+              <p class="card__label">Подписка</p>
+              <span class="muted">Vita Ratio</span>
             </div>
-            <p id="ai-paywall-text" class="muted">ИИ-ассистент отвечает на любые вопросы: учёба, тренировки, еда, код, что угодно.</p>
-            <button type="button" id="ai-subscribe-btn" class="btn btn--accent btn--wide">Подключить ИИ · +100 ₽/мес</button>
-            <p id="ai-paywall-note" class="ai-paywall__note" hidden></p>
+            <p id="subscription-status" class="subscription-status" hidden></p>
+            <div class="ai-plan-row">
+              <div class="ai-plan-info">
+                <p class="ai-plan-title">ИИ-ассистент</p>
+                <p id="ai-plan-status" class="ai-plan-status" aria-live="polite">ИИ +100 ₽/мес</p>
+              </div>
+              <button type="button" id="ai-plan-toggle" class="ai-plan-toggle" role="switch"
+                      aria-checked="false" aria-labelledby="ai-plan-status" aria-label="Включить ИИ-аддон">
+                <span class="ai-plan-toggle__knob" aria-hidden="true"></span>
+              </button>
+            </div>
+            <p class="micro-note">ИИ-аддон — отдельная подписка +100 ₽/мес. Переключатель только включает и выключает ИИ: оплаченный период сохраняется.</p>
           </article>
-
-          <div class="ai-chat">
-            <ul id="ai-chat-list" class="ai-chat-list" aria-live="polite"></ul>
-            <p id="ai-chat-empty" class="empty">Задай любой вопрос — я помогу: учёба, тренировки, еда, код, что угодно.</p>
-            <p id="ai-typing" class="ai-typing" hidden>🤖 ИИ печатает…</p>
-          </div>
         </div>
-
-        <!-- Ввод закреплён снизу над таб-баром, отступ учитывает safe-area. -->
-        <form id="ai-composer" class="ai-composer" novalidate hidden>
-          <label class="visually-hidden" for="ai-input">Сообщение ИИ-ассистенту</label>
-          <textarea id="ai-input" maxlength="2000" rows="1"
-                    placeholder="Спроси что угодно…"></textarea>
-          <button type="submit" id="ai-send" class="btn btn--accent ai-send">Отправить</button>
-        </form>
       </section>
     </main>
 
@@ -844,6 +874,10 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM18.5 15.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z"/></svg>
         <span>ИИ</span>
       </button>
+      <button type="button" id="tab-settings" class="tab" data-screen="settings" aria-label="Настройки">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z"/><path d="M19.4 13a7.6 7.6 0 0 0 0-2l2-1.5-2-3.4-2.3.9a7.6 7.6 0 0 0-1.7-1l-.4-2.5h-4l-.4 2.5a7.6 7.6 0 0 0-1.7 1l-2.3-.9-2 3.4 2 1.5a7.6 7.6 0 0 0 0 2l-2 1.5 2 3.4 2.3-.9a7.6 7.6 0 0 0 1.7 1l.4 2.5h4l.4-2.5a7.6 7.6 0 0 0 1.7-1l2.3.9 2-3.4z"/></svg>
+        <span>Настройки</span>
+      </button>
     </nav>
   </div>
 
@@ -866,6 +900,25 @@
       </div>
       <button type="button" id="sub-pay-btn" class="btn btn--accent btn--wide">Оплатить 250 ₽</button>
       <p id="sub-pay-note" class="paywall__note" hidden></p>
+    </div>
+  </div>
+
+  <!-- ==================== PAYWALL ИИ-АДДОНА (ИЗ «НАСТРОЕК») ==================== -->
+  <!-- Немодальная для недельного чек-ина, но блокирует фон: кнопка «Отмена» и Escape.
+       Оплата kind=ai — тот же POST /api/pay/invoice, что у #ai-subscribe-btn. -->
+  <div id="ai-plan-paywall" class="modal ai-plan-paywall" role="dialog" aria-modal="true"
+       aria-labelledby="ai-plan-paywall-title" aria-describedby="ai-plan-paywall-desc" hidden>
+    <div class="modal__panel ai-plan-paywall__panel">
+      <p class="eyebrow">ИИ-ассистент</p>
+      <h2 id="ai-plan-paywall-title" class="modal__title">ИИ-аддон · 100 ₽/мес</h2>
+      <p id="ai-plan-paywall-desc" class="muted">ИИ отвечает на любые вопросы: учёба, тренировки, еда, код, что угодно. Подключается отдельно от подписки Vita Ratio.</p>
+      <div class="paywall__price" aria-label="Стоимость ИИ-аддона">
+        <p class="paywall__price-main"><span id="ai-plan-paywall-price">100</span> ₽<span class="paywall__price-period">/мес</span></p>
+        <p class="paywall__price-stars">или <span id="ai-plan-paywall-stars">60</span> Stars в Telegram</p>
+      </div>
+      <button type="button" id="ai-plan-pay-btn" class="btn btn--accent btn--wide">Оплатить 100 ₽</button>
+      <p id="ai-plan-pay-note" class="paywall__note" hidden></p>
+      <button type="button" id="ai-plan-pay-cancel" class="btn btn--ghost btn--wide">Отмена</button>
     </div>
   </div>
 

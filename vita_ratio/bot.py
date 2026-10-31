@@ -69,6 +69,10 @@ NO_PROFILE_TEXT = (
     "Кнопка приложения — в команде /app."
 )
 
+#: Подсказки ИИ (CONTRACT §37–38): тумблер выключен vs нет оплаченного аддона.
+AI_OFF_TEXT = "ИИ выключен — включи в Настройках приложения: /app"
+AI_PAYWALL_TEXT = "ИИ +100 ₽/мес — /subscription"
+
 HELP_TITLE = "🤖 <b>Vita Ratio — что я умею</b>"
 HELP_BODY = """<b>Команды</b>
 /start — приветствие и кнопка приложения
@@ -139,15 +143,21 @@ def subscription_active(profile: Any, today: str) -> bool:
     return _date_active(_dget(profile, "sub_until", None), today)
 
 
-def effective_ai(profile: Any, today: str) -> bool:
-    """Эффективный ИИ: флаг ai_enabled И оплаченный ai_until >= today."""
+def ai_flag_enabled(profile: Any) -> bool:
+    """Сырой флаг ``profiles.ai_enabled`` (без проверки срока/free)."""
     if not profile:
         return False
     try:
-        flag = int(_dget(profile, "ai_enabled", 0) or 0)
+        return int(_dget(profile, "ai_enabled", 0) or 0) == 1
     except (TypeError, ValueError):
-        flag = 0
-    return flag == 1 and _date_active(_dget(profile, "ai_until", None), today)
+        return False
+
+
+def effective_ai(profile: Any, today: str) -> bool:
+    """Эффективный ИИ: флаг ai_enabled И оплаченный ai_until >= today."""
+    return ai_flag_enabled(profile) and _date_active(
+        _dget(profile, "ai_until", None), today
+    )
 
 
 def _is_free_message(
@@ -319,6 +329,35 @@ def _sender_id(message: Any) -> Any:
     if sender is not None:
         return getattr(sender, "id", None)
     return getattr(getattr(message, "chat", None), "id", None)
+
+
+def _ai_available(
+    settings_obj: Settings,
+    message: Any,
+    conn: sqlite3.Connection | None,
+    profile: Any,
+    today: str,
+) -> bool:
+    """Единый ИИ-гейт для ``/ask``, ``/note`` и ``/export`` (CONTRACT §37–38).
+
+    Учитывает флаг ``ai_enabled`` И срок (free или ``ai_until >= today``).
+    """
+    sender = _sender(message)
+    return ai.is_ai_available(
+        settings_obj,
+        user_id=_sender_id(message),
+        username=getattr(sender, "username", None) if sender else None,
+        conn=conn,
+        profile=profile,
+        today=today,
+    )
+
+
+def _ai_hint(profile: Any) -> str:
+    """Подсказка, почему ИИ недоступен: тумблер выключен или нужен аддон."""
+    if not ai_flag_enabled(profile):
+        return AI_OFF_TEXT
+    return AI_PAYWALL_TEXT
 
 
 def _command_args(message: Any) -> str:
@@ -1541,7 +1580,9 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
         try:
             profile = get_profile(conn, user_id)
             today = calc.local_today(default_tz)
-            use_llm = _is_free_message(settings_obj, message, conn) or effective_ai(profile, today)
+            use_llm = _ai_available(
+                settings_obj, message, conn, profile, today
+            )
             filename, payload = await asyncio.to_thread(
                 reports.build, conn, user_id, period, fmt, use_llm=use_llm)
         except Exception:
@@ -1562,14 +1603,15 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
             await message.answer("✍️ Напиши так: <code>/note сегодня тяжело, мало спал</code>")
             return
         user_id = user_id_of(message)
-        free = _is_free_message(settings_obj, message, conn)
         try:
             profile = get_profile(conn, user_id)
             today = calc.local_today(
                 _profile_tz(profile, default_tz) if profile else default_tz
             )
-            # v5: ИИ работает при оплаченном ai_until (CONTRACT §22–24) или бесплатно.
-            ai_enabled = free or effective_ai(profile, today)
+            # Эффективный ИИ: флаг ai_enabled И (free или ai_until >= today).
+            ai_enabled = _ai_available(
+                settings_obj, message, conn, profile, today
+            )
             reply = await asyncio.to_thread(
                 reports.save_note, conn, user_id, text, None, ai_enabled
             )
@@ -1578,12 +1620,8 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
             await message.answer("😔 Не получилось сохранить заметку. Попробуй ещё раз чуть позже.")
             return
         if not ai_enabled:
-            # ИИ-разбор выключен/не оплачен: заметка сохранена, модель не вызывалась.
-            await answer(
-                message,
-                "📝 Заметка сохранена. ИИ-разбор не подключён — "
-                "ИИ +100 ₽/мес: /subscription",
-            )
+            # Заметка сохранена, модель не вызывалась: подсказываем, что делать.
+            await answer(message, "📝 Заметка сохранена. " + _ai_hint(profile))
             return
         await answer(message, "📝 <b>Заметка сохранена.</b>\n\n🤖 <b>ИИ-разбор:</b>\n" + _esc(reply))
 
@@ -1611,8 +1649,8 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
         """Свободный вопрос ИИ (алиас /ai): контекст из ai_chat, ответ до 4000.
 
         Base-гейт здесь не нужен (``/ask`` в :data:`FREE_COMMANDS`): доступ
-        проверяется только по ИИ-тарифу, а при его отсутствии — подсказка
-        «ИИ +100 ₽/мес — /subscription».
+        проверяется только по эффективному ИИ-тарифу (флаг и срок). Если
+        тумблер выключен — подсказка «ИИ выключен…», иначе — «ИИ +100 ₽/мес».
         """
         question = _command_args(message)
         if not question:
@@ -1622,23 +1660,14 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
             await message.answer("Вопрос слишком длинный — до 2000 символов.")
             return
         user_id = user_id_of(message)
-        sender = _sender(message)
-        username = getattr(sender, "username", None) if sender else None
         try:
             profile = get_profile(conn, user_id)
             today = calc.local_today(
                 _profile_tz(profile, default_tz) if profile else default_tz
             )
-            # Гейт ИИ: free/промо или оплаченный ai_until (CONTRACT §22, §29).
-            if not ai.is_ai_available(
-                settings_obj,
-                user_id=user_id,
-                username=username,
-                conn=conn,
-                profile=profile,
-                today=today,
-            ):
-                await answer(message, "🔒 ИИ +100 ₽/мес — /subscription")
+            # Гейт ИИ: флаг ai_enabled И (free/промо или ai_until >= today).
+            if not _ai_available(settings_obj, message, conn, profile, today):
+                await answer(message, "🔒 " + _ai_hint(profile))
                 return
             # История — до нового сообщения; в модель уходят последние 12.
             history = store.list_chat_messages(conn, user_id, ai.HISTORY_LIMIT)

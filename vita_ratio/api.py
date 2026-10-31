@@ -107,13 +107,15 @@ def ai_active(profile: dict | None, today: str) -> bool:
 
 
 def effective_ai(profile: dict | None, today: str, free: bool = False) -> bool:
-    """Эффективный ИИ: флаг включён пользователем И оплачен до сегодня.
+    """Эффективный ИИ: флаг включён пользователем И срок до сегодня.
 
-    Для пользователей из белого списка (CONTRACT §29) ИИ доступен всегда.
+    Для пользователей из белого списка (CONTRACT §29/§37–38) срок не нужен,
+    но флаг ``ai_enabled`` уважается: выключил тумблер — ИИ не работает.
     """
+    enabled = bool((profile or {}).get("ai_enabled"))
     if free:
-        return True
-    return bool((profile or {}).get("ai_enabled")) and ai_active(profile, today)
+        return enabled
+    return enabled and ai_active(profile, today)
 
 
 def gate_enabled(settings_obj) -> bool:
@@ -171,18 +173,21 @@ def _subscription_json(
 ) -> dict:
     """Ответ GET /api/subscription и статусы подписки для bootstrap/profile.
 
-    Для бесплатного доступа (§29) подписка и ИИ считаются активными бессрочно,
-    а даты окончания не показываются.
+    ``ai_enabled`` — сырой флаг пользователя (как в ``profiles.ai_enabled``),
+    ``ai_active`` — эффективный доступ (флаг И срок/free). Для бесплатного
+    доступа (§29) подписка активна бессрочно, даты не показываются, но тумблер
+    ИИ работает по флагу (§37–38).
     """
     profile = profile or {}
     free = bool(free)
+    ai_flag = bool(profile.get("ai_enabled"))
     if free:
         return {
             "active": True,
             "until": None,
-            "ai_active": True,
+            "ai_active": effective_ai(profile, today, True),
             "ai_until": None,
-            "ai_enabled": True,
+            "ai_enabled": ai_flag,
             "base_price_rub": int(settings_obj.base_price_rub),
             "base_price_stars": int(settings_obj.base_price_stars),
             "ai_price_rub": int(settings_obj.ai_price_rub),
@@ -195,9 +200,9 @@ def _subscription_json(
     return {
         "active": subscription_active(profile, today),
         "until": profile.get("sub_until") or None,
-        "ai_active": ai_active(profile, today),
+        "ai_active": effective_ai(profile, today),
         "ai_until": profile.get("ai_until") or None,
-        "ai_enabled": effective_ai(profile, today),
+        "ai_enabled": ai_flag,
         "base_price_rub": int(settings_obj.base_price_rub),
         "base_price_stars": int(settings_obj.base_price_stars),
         "ai_price_rub": int(settings_obj.ai_price_rub),
@@ -559,7 +564,10 @@ def _profile_json(
         "sleep_bed": profile.get("sleep_bed"),
         "sleep_wake": profile.get("sleep_wake"),
         "reminders": bool(profile.get("reminders")),
-        "ai_enabled": effective_ai(profile, day, free),
+        # ai_enabled — сырой флаг пользователя, ai_active — эффективный доступ
+        # (флаг И срок/free), CONTRACT §38.
+        "ai_enabled": bool(profile.get("ai_enabled")),
+        "ai_active": effective_ai(profile, day, free),
         "sub_until": None if free else profile.get("sub_until") or None,
         "ai_until": None if free else profile.get("ai_until") or None,
         "free": free,
@@ -1486,6 +1494,27 @@ def _ai_enabled(profile: dict | None, today: str, free: bool = False) -> bool:
     return effective_ai(profile, today, free)
 
 
+def _ai_available(
+    settings_obj,
+    user: dict,
+    conn,
+    profile: dict | None,
+    today: str,
+) -> bool:
+    """Единый гейт свободного ИИ для GET/POST ``/api/ai/chat`` (CONTRACT §37–38).
+
+    Учитывает и флаг ``ai_enabled``, и срок (free или ``ai_until >= today``).
+    """
+    return ai.is_ai_available(
+        settings_obj,
+        user_id=user.get("id"),
+        username=user.get("username"),
+        conn=conn,
+        profile=profile,
+        today=today,
+    )
+
+
 async def get_notes(request: web.Request) -> web.Response:
     """Последние заметки (новые сверху) + текущее состояние ИИ-разбора."""
     user = _user(request)
@@ -1569,14 +1598,7 @@ async def get_ai_chat(request: web.Request) -> web.Response:
     limit = _query_int(request, "limit", 30, 1, 100)
     profile = store.get_profile(conn, user["id"])
     today = calc.local_today(settings.timezone)
-    available = ai.is_ai_available(
-        settings,
-        user_id=user["id"],
-        username=user.get("username"),
-        conn=conn,
-        profile=profile,
-        today=today,
-    )
+    available = _ai_available(settings, user, conn, profile, today)
     rows = store.list_chat_messages(conn, user["id"], limit)
     return json_ok(
         {
@@ -1589,7 +1611,8 @@ async def get_ai_chat(request: web.Request) -> web.Response:
 async def post_ai_chat(request: web.Request) -> web.Response:
     """POST /api/ai/chat {"text"} — свободный вопрос ИИ с контекстом диалога.
 
-    Гейт — только ИИ-доступ (как у ИИ-разбора заметок): при неактивном аддоне
+    Гейт — только эффективный ИИ-доступ (CONTRACT §37–38): нужны включённый
+    флаг ``ai_enabled`` и активный срок (free или ``ai_until >= today``), иначе
     402 ``ai_subscription_required``. При сбое модели чат не ломается: ответ
     подменяется :func:`ai.local_chat_fallback`, обе реплики сохраняются.
     """
@@ -1600,14 +1623,7 @@ async def post_ai_chat(request: web.Request) -> web.Response:
     text = _text_value(payload.get("text"), "text", 2000, required=True)
     profile = store.get_profile(conn, user["id"])
     today = calc.local_today(settings.timezone)
-    if not ai.is_ai_available(
-        settings,
-        user_id=user["id"],
-        username=user.get("username"),
-        conn=conn,
-        profile=profile,
-        today=today,
-    ):
+    if not _ai_available(settings, user, conn, profile, today):
         raise ApiError(
             402,
             "ai_subscription_required",
