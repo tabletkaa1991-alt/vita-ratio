@@ -698,12 +698,21 @@
               <p class="card__label">Заметки и ИИ</p>
               <span class="muted">до 30 последних</span>
             </div>
+            <!-- Аддон ИИ: показывается вместо тумблера, когда ai_active=false (CONTRACT §25). -->
+            <div id="ai-addon" class="ai-addon" hidden>
+              <p id="ai-addon-title" class="ai-addon__title">ИИ-разбор — +100 ₽/мес</p>
+              <p class="ai-addon__text muted">Разбор заметок и отчётов ИИ. Аддон к подписке Vita Ratio.</p>
+              <button type="button" id="ai-addon-btn" class="btn btn--accent btn--wide">Подключить ИИ</button>
+              <p id="ai-addon-note" class="ai-addon__note" hidden></p>
+            </div>
+
             <button type="button" id="ai-toggle" class="ai-toggle" role="switch" aria-checked="false"
                     aria-describedby="ai-toggle-hint">
               <span class="ai-toggle__track" aria-hidden="true"><span class="ai-toggle__thumb"></span></span>
               <span id="ai-toggle-label" class="ai-toggle__label">Включить ИИ</span>
             </button>
             <p id="ai-toggle-hint" class="ai-toggle__hint" hidden>ИИ-разбор заметок выключен</p>
+            <p id="ai-active-until" class="ai-toggle__active" hidden></p>
 
             <form id="note-form" class="form form--inline note-form" novalidate>
               <div class="field">
@@ -718,6 +727,9 @@
             <ul id="notes-list" class="notes-list"></ul>
             <p id="notes-empty" class="empty" hidden>Заметок пока нет — добавь первую.</p>
           </article>
+
+          <!-- Статус подписки под карточкой «Заметки и ИИ» (CONTRACT §25). -->
+          <p id="subscription-status" class="subscription-status" hidden></p>
 
           <article class="card" aria-label="Профиль и цели">
             <div class="card__head">
@@ -829,6 +841,26 @@
   </div>
 
   <div id="toast-container" class="toasts" role="status" aria-live="polite"></div>
+
+  <!-- ==================== ПОДПИСКА (PAYWALL) ==================== -->
+  <!-- Блокирующий экран поверх приложения: закрыть нельзя (CONTRACT §25).
+       Показывается только при subscription.active=false и subscription.enforced=true. -->
+  <div id="sub-paywall" class="paywall" role="dialog" aria-modal="true"
+       aria-labelledby="sub-paywall-title" aria-describedby="sub-paywall-desc"
+       data-dismissible="false" hidden>
+    <div class="paywall__panel">
+      <p class="eyebrow">Подписка</p>
+      <h2 id="sub-paywall-title" class="paywall__title">Vita Ratio — 250 ₽/мес</h2>
+      <p id="sub-paywall-desc" class="paywall__desc">Доступ к боту и приложению: питание, сон, расписание и прогресс.</p>
+      <p id="sub-trial" class="paywall__trial" hidden>Пробный период: 7 дней</p>
+      <div id="sub-price" class="paywall__price" aria-label="Стоимость подписки">
+        <p class="paywall__price-main"><span id="sub-price-rub">250</span> ₽<span class="paywall__price-period">/мес</span></p>
+        <p class="paywall__price-stars">или <span id="sub-price-stars">150</span> Stars в Telegram</p>
+      </div>
+      <button type="button" id="sub-pay-btn" class="btn btn--accent btn--wide">Оплатить 250 ₽</button>
+      <p id="sub-pay-note" class="paywall__note" hidden></p>
+    </div>
+  </div>
 
   <!-- ==================== ОБЯЗАТЕЛЬНЫЙ НЕДЕЛЬНЫЙ ЧЕК-ИН ==================== -->
   <!-- Модалку нельзя закрыть: нет крестика, backdrop/Escape игнорируются (CONTRACT §16.3). -->

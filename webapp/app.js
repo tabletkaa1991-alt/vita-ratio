@@ -56,7 +56,11 @@
     bad_request: 'Проверь введённые данные и попробуй ещё раз.',
     invalid_json: 'Сервер не понял запрос. Попробуй ещё раз.',
     network: 'Нет связи с сервером. Проверь, что он запущен.',
-    bad_response: 'Сервер ответил неожиданно. Попробуй ещё раз.'
+    bad_response: 'Сервер ответил неожиданно. Попробуй ещё раз.',
+    subscription_required: 'Нужна подписка Vita Ratio — 250 ₽/мес.',
+    ai_subscription_required: 'ИИ-разбор — отдельный аддон +100 ₽/мес.',
+    base_required: 'Сначала оформи подписку Vita Ratio.',
+    invoice_failed: 'Не удалось создать счёт в Telegram. Попробуй позже.'
   };
 
   /* ======================= состояние ======================= */
@@ -103,6 +107,9 @@
     progress: { weights: null, stats: null, loading: false },
     /* Заметки и ИИ (CONTRACT §20): отдельная загрузка, не блокирует «Прогресс». */
     notes: { items: [], aiEnabled: false, loading: false, loaded: false, reload: false, saving: false, busy: false },
+    /* Подписка (CONTRACT §22–25): GET /api/subscription + bootstrap.subscription. */
+    subscription: { data: null, loading: false, loaded: false, reload: false, missing: false },
+    pay: { baseBusy: false, aiBusy: false, forcePaywall: false },
     theme: {
       accent: DEFAULT_THEME.accent,
       bg: DEFAULT_THEME.bg,
@@ -751,6 +758,12 @@
       renderToday();
       refreshAuxScreens();
       handleWeeklyDue(state.bootstrap);
+      /* Подписка приходит с bootstrap и/или отдельным GET /api/subscription.
+         Bootstrap-срез применяем сразу, затем обновляем отдельным запросом. */
+      var bootSubscription = normalizeSubscription(data && data.subscription);
+      if (bootSubscription) { state.subscription.data = bootSubscription; }
+      renderSubscription();
+      loadSubscription();
       if (state.bootstrapReload) {
         state.bootstrapReload = false;
         loadBootstrap();
@@ -761,6 +774,9 @@
       byId('today-content').classList.add('is-error');
       byId('today-error').hidden = false;
       toast(errorText(error.code), 'error');
+      /* Даже если bootstrap не загрузился (402/сеть), проверяем подписку:
+         иначе paywall не покажется, а экраны останутся пустыми. */
+      loadSubscription();
       if (state.bootstrapReload) {
         state.bootstrapReload = false;
         loadBootstrap();
@@ -790,6 +806,404 @@
 
   function currentProfile() {
     return (state.bootstrap && state.bootstrap.profile) || null;
+  }
+
+  /* ======================= подписка и paywall (v5) ======================= */
+
+  /* Значения по умолчанию — из CONTRACT §22/§23. Если API ещё не готов
+     (404) или поле не пришло, работает фолбэк: остальные экраны не ломаются. */
+  var SUBSCRIPTION_DEFAULTS = {
+    active: false,
+    until: null,
+    ai_active: false,
+    ai_until: null,
+    ai_enabled: false,
+    base_price_rub: 250,
+    base_price_stars: 150,
+    ai_price_rub: 100,
+    ai_price_stars: 60,
+    period_days: 30,
+    trial_days: 7,
+    enforced: false
+  };
+
+  function normalizeSubscription(raw) {
+    if (!raw || typeof raw !== 'object') { return null; }
+    var out = {};
+    Object.keys(SUBSCRIPTION_DEFAULTS).forEach(function (key) {
+      out[key] = raw[key] == null ? SUBSCRIPTION_DEFAULTS[key] : raw[key];
+    });
+    out.active = flagOn(raw.active);
+    out.ai_active = flagOn(raw.ai_active);
+    out.ai_enabled = flagOn(raw.ai_enabled);
+    out.enforced = flagOn(raw.enforced);
+    out.base_price_rub = Math.max(1, int(raw.base_price_rub, 250));
+    out.base_price_stars = Math.max(1, int(raw.base_price_stars, 150));
+    out.ai_price_rub = Math.max(1, int(raw.ai_price_rub, 100));
+    out.ai_price_stars = Math.max(1, int(raw.ai_price_stars, 60));
+    out.period_days = Math.max(1, int(raw.period_days, 30));
+    out.trial_days = Math.max(0, int(raw.trial_days, 7));
+    /* Триал может прийти флагом/датой — используем для подписи статуса. */
+    out.trial = flagOn(raw.trial) || flagOn(raw.is_trial) || !!raw.trial_until;
+    return out;
+  }
+
+  /* Источник правды: GET /api/subscription, иначе срез из bootstrap. */
+  function subscriptionPayload() {
+    if (state.subscription.data) { return state.subscription.data; }
+    var boot = state.bootstrap || {};
+    var raw = boot.subscription;
+    /* На случай, если bootstrap отдаёт короткий объект sub (CONTRACT §23). */
+    if (!raw && boot.sub && typeof boot.sub === 'object') { raw = boot.sub; }
+    return normalizeSubscription(raw);
+  }
+
+  function subscriptionIsTrial(sub) {
+    if (!sub) { return false; }
+    if (sub.trial === true || sub.trial_until) { return true; }
+    var profile = currentProfile();
+    return !!(profile && (flagOn(profile.sub_trial) || flagOn(profile.trial)));
+  }
+
+  function subscriptionStatusText(sub) {
+    if (!sub) { return ''; }
+    var until = sub.trial_until || sub.until;
+    if (sub.active) {
+      if (!until) { return subscriptionIsTrial(sub) ? 'Пробный период активен' : 'Подписка активна'; }
+      return (subscriptionIsTrial(sub) ? 'Пробный период до ' : 'Подписка активна до ') + dateShort(until);
+    }
+    return 'Подписка не активна';
+  }
+
+  function subscriptionPaywallVisible() {
+    if (state.pay.forcePaywall) { return true; }
+    var sub = subscriptionPayload();
+    /* Блокируем доступ только когда подписка не активна и режим включён. */
+    return !!(sub && sub.active !== true && sub.enforced === true);
+  }
+
+  function setPaywallVisible(visible) {
+    var node = byId('sub-paywall');
+    if (!node) { return; }
+    node.hidden = !visible;
+    document.body.classList.toggle('paywall-open', !!visible);
+  }
+
+  function renderPaywall(sub) {
+    var rub = sub ? sub.base_price_rub : SUBSCRIPTION_DEFAULTS.base_price_rub;
+    var stars = sub ? sub.base_price_stars : SUBSCRIPTION_DEFAULTS.base_price_stars;
+    var trialDays = sub ? sub.trial_days : SUBSCRIPTION_DEFAULTS.trial_days;
+    var title = byId('sub-paywall-title');
+    var rubNode = byId('sub-price-rub');
+    var starsNode = byId('sub-price-stars');
+    var trialNode = byId('sub-trial');
+    var button = byId('sub-pay-btn');
+    if (title) { title.textContent = 'Vita Ratio — ' + fmtInt(rub) + ' ₽/мес'; }
+    if (rubNode) { rubNode.textContent = fmtInt(rub); }
+    if (starsNode) { starsNode.textContent = fmtInt(stars); }
+    if (button) { button.textContent = 'Оплатить ' + fmtInt(rub) + ' ₽'; }
+    if (trialNode) {
+      if (trialDays > 0) {
+        trialNode.textContent = 'Пробный период: ' + trialDays + ' ' +
+          plural(trialDays, 'день', 'дня', 'дней');
+        trialNode.hidden = false;
+      } else {
+        trialNode.textContent = '';
+        trialNode.hidden = true;
+      }
+    }
+    setPaywallVisible(subscriptionPaywallVisible());
+  }
+
+  function renderSubscriptionStatus(sub) {
+    var node = byId('subscription-status');
+    if (!node) { return; }
+    if (!sub) {
+      node.textContent = '';
+      node.hidden = true;
+      node.classList.remove('subscription-status--trial');
+      return;
+    }
+    node.textContent = subscriptionStatusText(sub);
+    node.hidden = false;
+    node.classList.toggle('subscription-status--trial', sub.active && subscriptionIsTrial(sub));
+  }
+
+  function renderAiAddon(sub) {
+    var addon = byId('ai-addon');
+    var title = byId('ai-addon-title');
+    var activeUntil = byId('ai-active-until');
+    var note = byId('ai-addon-note');
+    var aiActive = sub ? sub.ai_active === true : null;
+    /* Плашка-аддон заменяет тумблер только когда подписка известна и ИИ не активен. */
+    if (addon) { addon.hidden = !(sub && aiActive === false); }
+    if (title && sub) {
+      title.textContent = 'ИИ-разбор — +' + fmtInt(sub.ai_price_rub) + ' ₽/мес';
+    }
+    if (activeUntil) {
+      if (sub && aiActive === true && sub.ai_until) {
+        activeUntil.textContent = 'ИИ активен до ' + dateShort(sub.ai_until);
+        activeUntil.hidden = false;
+      } else {
+        activeUntil.textContent = '';
+        activeUntil.hidden = true;
+      }
+    }
+    if (note && (!sub || aiActive !== false)) {
+      note.textContent = '';
+      note.hidden = true;
+    }
+  }
+
+  function renderSubscription() {
+    var sub = subscriptionPayload();
+    if (sub && sub.active === true) { state.pay.forcePaywall = false; }
+    if (!sub && state.pay.forcePaywall) {
+      sub = normalizeSubscription({}); // значения по умолчанию для paywall
+    }
+    renderPaywall(sub);
+    renderSubscriptionStatus(sub);
+    renderAiAddon(sub);
+    renderNotesToggle();
+  }
+
+  function loadSubscription(options) {
+    var opts = options || {};
+    if (state.subscription.loading) {
+      if (opts.force) { state.subscription.reload = true; }
+      return;
+    }
+    state.subscription.loading = true;
+    apiRequest('GET', '/api/subscription').then(function (data) {
+      state.subscription.loading = false;
+      state.subscription.loaded = true;
+      state.subscription.missing = false;
+      state.subscription.data = normalizeSubscription(data);
+      renderSubscription();
+      if (state.subscription.reload) {
+        state.subscription.reload = false;
+        loadSubscription();
+      }
+    }).catch(function (error) {
+      state.subscription.loading = false;
+      var code = error && error.code;
+      /* 404 — API подписки ещё не готов: молча живём на bootstrap-фолбэке. */
+      if (code === 'not_found' || code === 'http_404') {
+        state.subscription.missing = true;
+      }
+      renderSubscription();
+      if (state.subscription.reload) {
+        state.subscription.reload = false;
+        loadSubscription();
+      }
+    });
+  }
+
+  function invoiceErrorText(code) {
+    if (code === 'not_found' || code === 'http_404') {
+      return 'Оплата пока недоступна — попробуй позже.';
+    }
+    if (code === 'invoice_failed') {
+      return 'Не удалось создать счёт в Telegram. Попробуй ещё раз.';
+    }
+    if (code === 'base_required') {
+      return 'Сначала оформи подписку Vita Ratio.';
+    }
+    if (code === 'subscription_required' || code === 'http_402') {
+      return 'Нужна активная подписка Vita Ratio.';
+    }
+    if (code === 'ai_subscription_required') {
+      return 'ИИ-разбор — отдельный аддон +100 ₽/мес.';
+    }
+    return errorText(code);
+  }
+
+  function requestInvoice(kind) {
+    return apiRequest('POST', '/api/pay/invoice', { kind: kind }).then(function (data) {
+      var url = data && data.invoice_url;
+      if (!url) { throw makeError('invoice_failed'); }
+      return data;
+    });
+  }
+
+  /* openInvoice есть только в Telegram (SDK >= 6.1); в браузере — false. */
+  function openInvoice(url, onStatus) {
+    var tg = state.tg || (window.Telegram && window.Telegram.WebApp);
+    if (tg && typeof tg.openInvoice === 'function') {
+      try {
+        tg.openInvoice(url, function (status) { onStatus(status || 'unknown'); });
+        return true;
+      } catch (error) { /* ниже покажем подсказку со ссылкой */ }
+    }
+    return false;
+  }
+
+  /* Рублёвый эквайринг (ЮKassa/Robokassa): ссылка открывается в браузере,
+     оплату подтверждает вебхук провайдера (см. ?paid= при возврате). */
+  function openExternalInvoice(url) {
+    var tg = state.tg || (window.Telegram && window.Telegram.WebApp);
+    if (tg && typeof tg.openLink === 'function') {
+      try { tg.openLink(url); return true; } catch (error) { /* fallback ниже */ }
+    }
+    try {
+      window.location.href = url;
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /* Возврат со страницы оплаты (?paid=base|ai): досрочно проверяем счёт
+     (у ЮKassa вебхук может запаздывать) и перечитываем bootstrap. */
+  function refreshPaidInvoice(kind) {
+    apiRequest('POST', '/api/pay/refresh', { kind: kind }).catch(function () {
+      /* ошибку не показываем — статус всё равно перечитаем ниже */
+    }).then(function () {
+      afterPaymentRefresh();
+    });
+  }
+
+  function showInvoiceHint(kind, url) {
+    var node = kind === 'ai' ? byId('ai-addon-note') : byId('sub-pay-note');
+    if (!node) { return; }
+    var prefix = kind === 'ai' ? 'Подключить ИИ можно в Telegram:' : 'Оплатить можно в Telegram:';
+    node.innerHTML = esc(prefix) + ' <a href="' + esc(url) +
+      '" target="_blank" rel="noopener noreferrer">открыть счёт</a>';
+    node.hidden = false;
+  }
+
+  function hideInvoiceHint(kind) {
+    var node = kind === 'ai' ? byId('ai-addon-note') : byId('sub-pay-note');
+    if (node) {
+      node.textContent = '';
+      node.hidden = true;
+    }
+  }
+
+  function afterPaymentRefresh() {
+    loadBootstrap({ force: true });
+    loadSubscription({ force: true });
+  }
+
+  function handleInvoiceStatus(kind, status) {
+    if (status === 'paid') {
+      haptic('success');
+      if (kind === 'ai') {
+        /* Оплатили аддон — включаем ИИ и перечитываем профиль/подписку/заметки. */
+        apiRequest('PUT', '/api/ai', { enabled: true }).then(function () {
+          setAiEnabled(true);
+          renderNotesToggle();
+          toast('ИИ-разбор подключён');
+          afterPaymentRefresh();
+          loadNotes();
+        }).catch(function (error) {
+          var code = error && error.code;
+          if (code === 'base_required' || code === 'subscription_required' || code === 'http_402') {
+            state.pay.forcePaywall = true;
+            renderSubscription();
+            toast('Сначала оформи подписку Vita Ratio — 250 ₽/мес.', 'error');
+          } else {
+            toast(invoiceErrorText(code), 'error');
+          }
+          afterPaymentRefresh();
+        });
+        return;
+      }
+      /* Базовая подписка: скрываем paywall и перечитываем bootstrap. */
+      toast('Подписка оплачена — обновляю данные');
+      state.pay.forcePaywall = false;
+      setPaywallVisible(false);
+      afterPaymentRefresh();
+      return;
+    }
+    if (status === 'cancelled') {
+      haptic('select');
+      toast('Оплата отменена');
+      return;
+    }
+    if (status === 'failed') {
+      haptic('error');
+      toast('Оплата не прошла — попробуй ещё раз.', 'error');
+      return;
+    }
+    if (status === 'pending') {
+      toast('Платёж обрабатывается — загляни чуть позже');
+    }
+  }
+
+  function payBase() {
+    if (state.pay.baseBusy) { return; }
+    var button = byId('sub-pay-btn');
+    var sub = subscriptionPayload();
+    var rub = sub ? sub.base_price_rub : SUBSCRIPTION_DEFAULTS.base_price_rub;
+    state.pay.baseBusy = true;
+    setBusy(button, true);
+    hideInvoiceHint('base');
+    haptic('select');
+    requestInvoice('base').then(function (data) {
+      state.pay.baseBusy = false;
+      setBusy(button, false);
+      if (data.provider && data.provider !== 'stars') {
+        /* Карта/СБП: ссылка ЮKassa/Robokassa открывается в браузере. */
+        openExternalInvoice(data.invoice_url);
+        toast('Открой оплату и вернись в приложение');
+        return;
+      }
+      var opened = openInvoice(data.invoice_url, function (status) {
+        handleInvoiceStatus('base', status);
+      });
+      if (!opened) {
+        showInvoiceHint('base', data.invoice_url);
+        toast('Готово: оплати ' + fmtInt(rub) + ' ₽ в Telegram');
+      }
+    }).catch(function (error) {
+      state.pay.baseBusy = false;
+      setBusy(button, false);
+      haptic('error');
+      var code = error && error.code;
+      if (code === 'subscription_required' || code === 'http_402') { loadSubscription(); }
+      toast(invoiceErrorText(code), 'error');
+    });
+  }
+
+  function payAi() {
+    if (state.pay.aiBusy) { return; }
+    var button = byId('ai-addon-btn');
+    state.pay.aiBusy = true;
+    setBusy(button, true);
+    hideInvoiceHint('ai');
+    haptic('select');
+    requestInvoice('ai').then(function (data) {
+      state.pay.aiBusy = false;
+      setBusy(button, false);
+      if (data.provider && data.provider !== 'stars') {
+        /* Карта/СБП: ссылка ЮKassa/Robokassa открывается в браузере. */
+        openExternalInvoice(data.invoice_url);
+        toast('Открой оплату и вернись в приложение');
+        return;
+      }
+      var opened = openInvoice(data.invoice_url, function (status) {
+        handleInvoiceStatus('ai', status);
+      });
+      if (!opened) {
+        showInvoiceHint('ai', data.invoice_url);
+        toast('Готово: подключи ИИ в Telegram');
+      }
+    }).catch(function (error) {
+      state.pay.aiBusy = false;
+      setBusy(button, false);
+      haptic('error');
+      var code = error && error.code;
+      if (code === 'base_required') {
+        /* Аддон без base: показываем paywall базовой подписки. */
+        state.pay.forcePaywall = true;
+        renderSubscription();
+        toast('Сначала оформи подписку Vita Ratio — 250 ₽/мес.', 'error');
+        return;
+      }
+      if (code === 'subscription_required' || code === 'http_402') { loadSubscription(); }
+      toast(invoiceErrorText(code), 'error');
+    });
   }
 
   /* ======================= экран «Сегодня» ======================= */
@@ -3377,11 +3791,16 @@
 
   function renderNotesToggle() {
     var enabled = aiEnabledNow();
+    var sub = subscriptionPayload();
+    /* Если подписка известна и ИИ-аддон не активен — вместо тумблера
+       показываем плашку «ИИ-разбор — +100 ₽/мес» и кнопку (CONTRACT §25). */
+    var addonMode = !!(sub && sub.ai_active !== true);
     var toggle = byId('ai-toggle');
     var label = byId('ai-toggle-label');
     var hint = byId('ai-toggle-hint');
     var plaque = byId('notes-ai-off');
     if (toggle) {
+      toggle.hidden = addonMode;
       toggle.setAttribute('aria-checked', enabled ? 'true' : 'false');
       toggle.disabled = !!state.notes.busy;
       toggle.classList.toggle('is-busy', !!state.notes.busy);
@@ -3391,8 +3810,8 @@
       label.classList.toggle('is-on', enabled);
       label.classList.toggle('is-off', !enabled);
     }
-    if (hint) { hint.hidden = enabled; }
-    if (plaque) { plaque.hidden = enabled; }
+    if (hint) { hint.hidden = enabled || addonMode; }
+    if (plaque) { plaque.hidden = enabled || addonMode; }
   }
 
   function noteDateText(note) {
@@ -3482,6 +3901,16 @@
       renderNotesToggle();
       haptic('error');
       var code = error && error.code;
+      if (code === 'ai_subscription_required') {
+        toast('ИИ-разбор — отдельный аддон +100 ₽/мес.', 'error');
+        loadSubscription();
+        return;
+      }
+      if (code === 'subscription_required') {
+        toast('Нужна подписка Vita Ratio — 250 ₽/мес.', 'error');
+        loadSubscription();
+        return;
+      }
       toast(code === 'http_404' || code === 'not_found'
         ? 'ИИ пока недоступен — попробуй позже.'
         : errorText(code), 'error');
@@ -3922,6 +4351,10 @@
     byId('ai-toggle').addEventListener('click', toggleAi);
     byId('note-form').addEventListener('submit', submitNote);
 
+    // Подписка (v5): блокирующий paywall и аддон ИИ
+    byId('sub-pay-btn').addEventListener('click', payBase);
+    byId('ai-addon-btn').addEventListener('click', payAi);
+
     // Онбординг
     byId('onb-next').addEventListener('click', function () { goOnbStep(1); });
     byId('onb-back').addEventListener('click', function () { goOnbStep(-1); });
@@ -3970,6 +4403,20 @@
     bindEvents();
     switchTab('today', { force: true });
     loadBootstrap(); // цели нужны любому экрану, даже если стартовая вкладка не «Сегодня»
+
+    /* Возврат со страницы рублёвой оплаты: ?paid=base|ai -> refresh + bootstrap. */
+    var paid = params && params.get('paid');
+    if (paid === 'base' || paid === 'ai') {
+      refreshPaidInvoice(paid);
+      try {
+        params.delete('paid');
+        window.history.replaceState(
+          null,
+          '',
+          window.location.pathname + (params.toString() ? '?' + params.toString() : '')
+        );
+      } catch (error) { /* noop — старые WebView могут запрещать history API */ }
+    }
 
     window.setInterval(updateClassCountdown, 30000);
     document.addEventListener('visibilitychange', function () {

@@ -40,8 +40,12 @@ def _bounds(period: str, today: str) -> tuple[str, str, str]:
 
 
 def collect(conn: sqlite3.Connection, user_id: int, period: str = "day", today: str | None = None,
-            comment: bool = True) -> dict:
-    """Сводка за период: профиль, цели, дни, сон, вес, план, занятия, заметки."""
+            comment: bool = True, use_llm: bool | None = None) -> dict:
+    """Сводка за период: профиль, цели, дни, сон, вес, план, занятия, заметки.
+
+    ``use_llm`` передаётся в :func:`ai_comment`: ``None`` — решает env ``AI_COMMENT``,
+    ``False`` — только локальный коуч (ИИ-аддон не оплачен), ``True`` — пробуем модель.
+    """
     today = today or calc.local_today()
     start, end, label = _bounds(period, today)
     uid = int(user_id)
@@ -120,7 +124,7 @@ def collect(conn: sqlite3.Connection, user_id: int, period: str = "day", today: 
         },
         "notes": notes,
     }
-    data["comment"] = ai_comment(data) if comment else ""
+    data["comment"] = ai_comment(data, use_llm=use_llm) if comment else ""
     return data
 
 
@@ -351,15 +355,25 @@ def last_notes(conn: sqlite3.Connection, user_id: int, limit: int = 5) -> list[d
 
 # --- форматы ------------------------------------------------------------------
 
-def build(conn: sqlite3.Connection, user_id: int, period: str = "day", fmt: str = "png") -> tuple[str, bytes]:
-    """Возвращает (имя файла, содержимое) для отправки в Telegram."""
+def build(
+    conn: sqlite3.Connection,
+    user_id: int,
+    period: str = "day",
+    fmt: str = "png",
+    use_llm: bool | None = None,
+) -> tuple[str, bytes]:
+    """Возвращает (имя файла, содержимое) для отправки в Telegram.
+
+    ``use_llm`` — признак оплаченного ИИ: ``False`` оставляет только локальный
+    разбор (CONTRACT §23), ``None`` — авто по env ``AI_COMMENT``.
+    """
     period = (period or "day").lower()
     fmt = (fmt or "png").lower()
     if period not in PERIODS:
         raise ValueError(f"period должен быть один из {sorted(PERIODS)}")
     if fmt not in ("png", "docx", "xlsx"):
         raise ValueError("fmt должен быть png, docx или xlsx")
-    data = collect(conn, user_id, period)
+    data = collect(conn, user_id, period, use_llm=use_llm)
     payload = {"png": _png, "docx": _docx, "xlsx": _xlsx}[fmt](data)
     return f"vita-ratio-{period}-{data['start']}.{fmt}", payload
 

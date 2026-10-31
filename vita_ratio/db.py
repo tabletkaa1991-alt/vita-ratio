@@ -14,6 +14,8 @@ MIGRATIONS: dict[str, dict[str, str]] = {
         "goal_weight_kg": "REAL",
         "goal_date": "TEXT",
         "ai_enabled": "INTEGER NOT NULL DEFAULT 0",
+        "sub_until": "TEXT",
+        "ai_until": "TEXT",
         "theme_accent": "TEXT NOT NULL DEFAULT '#B7F75C'",
         "theme_bg": "TEXT NOT NULL DEFAULT '#0E1116'",
         "theme_card": "TEXT NOT NULL DEFAULT '#151A21'",

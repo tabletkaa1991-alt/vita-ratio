@@ -48,6 +48,21 @@ class Settings:
     admin_id: int | None = None
     proxy_url: str = ""
     root: Path = ROOT
+    # Подписки (Telegram Stars): бот 250 ₽/мес, аддон ИИ +100 ₽/мес.
+    base_price_rub: int = 250
+    base_price_stars: int = 150
+    ai_price_rub: int = 100
+    ai_price_stars: int = 60
+    sub_period_days: int = 30
+    trial_days: int = 7
+    subscription_enforced: bool = True
+    # Рублёвый эквайринг (карта → карта самозанятого): stars | yookassa | robokassa | manual
+    pay_provider: str = "stars"
+    yookassa_shop_id: str = ""
+    yookassa_secret: str = ""
+    robokassa_login: str = ""
+    robokassa_password1: str = ""
+    robokassa_password2: str = ""
 
     @property
     def webapp_dir(self) -> Path:
@@ -89,6 +104,7 @@ def settings(from_env: bool = True) -> Settings:
     port_raw = get("APP_PORT", "").strip() or get("PORT", "").strip() or "8080"
 
     admin_raw = get("ADMIN_ID", "").strip()
+    enforced_raw = get("SUBSCRIPTION_ENFORCED", "1").strip().lower()
     return Settings(
         bot_token=get("BOT_TOKEN", "").strip(),
         bot_username=get("BOT_USERNAME", "").strip(),
@@ -100,4 +116,17 @@ def settings(from_env: bool = True) -> Settings:
         timezone=get("TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow",
         admin_id=_as_int(admin_raw, 0) or None,
         proxy_url=get("PROXY_URL", "").strip(),
+        base_price_rub=_as_int(get("BASE_PRICE_RUB", "250"), 250),
+        base_price_stars=_as_int(get("BASE_PRICE_STARS", "150"), 150),
+        ai_price_rub=_as_int(get("AI_PRICE_RUB", "100"), 100),
+        ai_price_stars=_as_int(get("AI_PRICE_STARS", "60"), 60),
+        sub_period_days=_as_int(get("SUB_PERIOD_DAYS", "30"), 30),
+        trial_days=_as_int(get("TRIAL_DAYS", "7"), 7),
+        subscription_enforced=enforced_raw not in {"0", "false", "no", "off"},
+        pay_provider=get("PAY_PROVIDER", "stars").strip().lower() or "stars",
+        yookassa_shop_id=get("YOOKASSA_SHOP_ID", "").strip(),
+        yookassa_secret=get("YOOKASSA_SECRET", "").strip(),
+        robokassa_login=get("ROBOKASSA_LOGIN", "").strip(),
+        robokassa_password1=get("ROBOKASSA_PASSWORD1", "").strip(),
+        robokassa_password2=get("ROBOKASSA_PASSWORD2", "").strip(),
     )

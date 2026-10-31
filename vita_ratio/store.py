@@ -8,11 +8,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import date as date_cls
 from datetime import datetime, timedelta
 
 from . import calc
+
+log = logging.getLogger("vita_ratio.store")
 
 #: Поля профиля, которые приходят из API (порядок важен для INSERT).
 PROFILE_FIELDS = (
@@ -783,6 +786,220 @@ def stats_days(conn: sqlite3.Connection, user_id: int, date_from: str, date_to: 
         )
         cursor += timedelta(days=1)
     return result
+
+
+# --- подписка и платежи (Telegram Stars, CONTRACT §22) -------------------------
+#: Допустимые виды платежа: base = подписка на бота, ai = аддон ИИ-разбора.
+PAYMENT_KINDS = ("base", "ai")
+
+
+def get_subscription(conn: sqlite3.Connection, user_id: int) -> dict:
+    """Даты подписки пользователя: ``{"sub_until": ISO|None, "ai_until": ISO|None}``.
+
+    Даты — включительные (подписка действует и в день ``until``). Без профиля
+    обе даты ``None``. Если старая база ещё без колонок — тоже ``None``.
+    """
+    try:
+        row = conn.execute(
+            "SELECT sub_until, ai_until FROM profiles WHERE user_id = ?",
+            (int(user_id),),
+        ).fetchone()
+    except sqlite3.Error:
+        return {"sub_until": None, "ai_until": None}
+    if row is None:
+        return {"sub_until": None, "ai_until": None}
+    return {
+        "sub_until": row["sub_until"] or None,
+        "ai_until": row["ai_until"] or None,
+    }
+
+
+def set_subscription(
+    conn: sqlite3.Connection,
+    user_id: int,
+    sub_until: str | None = None,
+    ai_until: str | None = None,
+) -> dict:
+    """Продлевает подписку: меняются только переданные (не ``None``) даты.
+
+    ``sub_until``/``ai_until`` живут в ``profiles`` отдельно от ``PROFILE_FIELDS``,
+    поэтому профиль-формат API не расширяется. Профиля нет — запись не создаётся
+    (подписка привязана к профилю), возвращаются текущие даты.
+    """
+    updates: list[str] = []
+    params: list = []
+    if sub_until is not None:
+        updates.append("sub_until = ?")
+        params.append(str(sub_until))
+    if ai_until is not None:
+        updates.append("ai_until = ?")
+        params.append(str(ai_until))
+    if updates:
+        updates.append("updated_at = ?")
+        params.extend([_now_iso(), int(user_id)])
+        try:
+            conn.execute(
+                f"UPDATE profiles SET {', '.join(updates)} WHERE user_id = ?", params
+            )
+            conn.commit()
+        except sqlite3.Error:
+            log.exception("Не удалось сохранить подписку user_id=%s", user_id)
+    return get_subscription(conn, user_id)
+
+
+def ensure_trial(
+    conn: sqlite3.Connection,
+    user_id: int,
+    days: int,
+    today: str | None = None,
+) -> dict:
+    """Триал новому профилю: если ``sub_until`` пуст, ставит ``today + days``.
+
+    Уже существующая/оплаченная подписка не трогается. Профиля нет — ничего не
+    делает (триал создаётся вместе с профилем, CONTRACT §22).
+    """
+    uid = int(user_id)
+    try:
+        row = conn.execute(
+            "SELECT sub_until FROM profiles WHERE user_id = ?", (uid,)
+        ).fetchone()
+    except sqlite3.Error:
+        return {"sub_until": None, "ai_until": None}
+    if row is None or row["sub_until"]:
+        return get_subscription(conn, uid)
+    try:
+        base = date_cls.fromisoformat(str(today) if today else calc.local_today())
+    except ValueError:
+        base = date_cls.fromisoformat(calc.local_today())
+    until = (base + timedelta(days=max(int(days), 0))).isoformat()
+    return set_subscription(conn, uid, sub_until=until)
+
+
+def add_payment(
+    conn: sqlite3.Connection,
+    user_id: int,
+    kind: str,
+    charge_id: str,
+    amount: int,
+    currency: str = "XTR",
+    payload: str = "",
+) -> bool:
+    """Пишет платёж Telegram Stars; ``False`` — ``charge_id`` уже был (идемпотентность).
+
+    ``UNIQUE(charge_id)`` + ``INSERT OR IGNORE`` гарантируют, что повторная
+    доставка ``successful_payment`` не продлит подписку второй раз.
+    """
+    normalized = str(kind or "").strip().lower()
+    if normalized not in PAYMENT_KINDS:
+        raise ValueError("kind платежа должен быть base или ai")
+    cursor = conn.execute(
+        """
+        INSERT OR IGNORE INTO payments (user_id, kind, charge_id, amount, currency, payload)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(user_id),
+            normalized,
+            str(charge_id),
+            int(amount or 0),
+            str(currency or "XTR"),
+            str(payload or ""),
+        ),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+# --- рублёвые счета эквайринга (invoices, v6) -----------------------------------
+
+#: Допустимые статусы счёта.
+INVOICE_STATUSES = ("pending", "succeeded", "canceled")
+
+
+def create_invoice(
+    conn: sqlite3.Connection,
+    user_id: int,
+    kind: str,
+    provider: str,
+    external_id: str,
+    amount_rub: float,
+    payload: str = "",
+) -> int:
+    """Создаёт рублёвый счёт и возвращает его ``id``.
+
+    ``external_id`` — id платежа у провайдера (YooKassa payment id / Robokassa
+    InvId), уникален (``UNIQUE(external_id)``): повторная вставка — ``IntegrityError``.
+    """
+    normalized = str(kind or "").strip().lower()
+    if normalized not in PAYMENT_KINDS:
+        raise ValueError("kind счёта должен быть base или ai")
+    external = str(external_id or "").strip()
+    if not external:
+        raise ValueError("external_id счёта не может быть пустым")
+    cursor = conn.execute(
+        """
+        INSERT INTO invoices (user_id, kind, provider, external_id, amount_rub, payload)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(user_id),
+            normalized,
+            str(provider or "yookassa").strip().lower() or "yookassa",
+            external,
+            float(amount_rub or 0),
+            str(payload or ""),
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid)
+
+
+def get_invoice_by_external(conn: sqlite3.Connection, external_id: str) -> dict | None:
+    """Счёт по ``external_id`` провайдера (или ``None``)."""
+    external = str(external_id or "").strip()
+    if not external:
+        return None
+    return _row(
+        conn.execute("SELECT * FROM invoices WHERE external_id = ?", (external,)).fetchone()
+    )
+
+
+def update_invoice_external(conn: sqlite3.Connection, row_id: int, external_id: str) -> None:
+    """Меняет ``external_id`` счёта (Robokassa: tmp-uuid → InvId = id строки)."""
+    conn.execute(
+        "UPDATE invoices SET external_id = ? WHERE id = ?",
+        (str(external_id), int(row_id)),
+    )
+    conn.commit()
+
+
+def mark_invoice(conn: sqlite3.Connection, external_id: str, status: str) -> None:
+    """Ставит статус счёта: pending / succeeded / canceled (чужой не трогает)."""
+    normalized = str(status or "").strip().lower()
+    if normalized not in INVOICE_STATUSES:
+        raise ValueError("status счёта должен быть pending, succeeded или canceled")
+    conn.execute(
+        "UPDATE invoices SET status = ? WHERE external_id = ?",
+        (normalized, str(external_id or "").strip()),
+    )
+    conn.commit()
+
+
+def find_pending_invoice(
+    conn: sqlite3.Connection, user_id: int, kind: str
+) -> dict | None:
+    """Последний неоплаченный счёт пользователя по виду (любой провайдер)."""
+    return _row(
+        conn.execute(
+            """
+            SELECT * FROM invoices
+            WHERE user_id = ? AND kind = ? AND status = 'pending'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (int(user_id), str(kind or "").strip().lower()),
+        ).fetchone()
+    )
 
 
 # --- план дня (day_plans) -------------------------------------------------------

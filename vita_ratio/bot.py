@@ -16,11 +16,12 @@ import html
 import logging
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import date as date_cls
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
@@ -32,10 +33,11 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    PreCheckoutQuery,
     WebAppInfo,
 )
 
-from . import calc, db, reports
+from . import calc, db, reports, store
 from .config import Settings
 from .config import settings as load_settings
 
@@ -78,9 +80,207 @@ HELP_BODY = """<b>Команды</b>
 /export — отчёт за день, неделю или месяц: PNG, DOCX или XLSX
 /note — заметка с разбором ИИ (например: /note сегодня тяжело, мало спал)
 /notes — последние заметки и ответы ИИ
+/subscription — подписка и оплата (250 ₽/мес, ИИ +100 ₽/мес)
 /help — эта справка
 
 Напоминания (приёмы пищи, сон, утренняя сводка) приходят, пока в профиле включён тумблер «Напоминания». Включить и выключить можно в мини-приложении."""
+
+# --- подписка (CONTRACT §22–24) ------------------------------------------------
+#: Текст гейта: команда недоступна без активной base-подписки.
+PAYWALL_TEXT = (
+    "🔒 <b>Подписка 250 ₽/мес нужна для доступа</b>\n\n"
+    "Оформить или продлить можно командой /subscription — оплата в Telegram Stars."
+)
+#: Команды, которые работают всегда (вне платного гейта).
+FREE_COMMANDS = frozenset({"/start", "/app", "/help", "/subscription"})
+#: Команды, которым нужна активная base-подписка.
+GATED_COMMANDS = frozenset({
+    "/today", "/plan", "/classes", "/sleep", "/targets", "/note", "/notes", "/export",
+})
+
+
+def _date_active(value: Any, today: str) -> bool:
+    """Дата подписки действует по ``today`` включительно; мусор -> False."""
+    if not value:
+        return False
+    try:
+        return date_cls.fromisoformat(str(value)[:10]) >= date_cls.fromisoformat(str(today)[:10])
+    except (TypeError, ValueError):
+        return False
+
+
+def subscription_active(profile: Any, today: str) -> bool:
+    """Активна ли base-подписка профиля (``sub_until`` включительно)."""
+    return _date_active(_dget(profile, "sub_until", None), today)
+
+
+def effective_ai(profile: Any, today: str) -> bool:
+    """Эффективный ИИ: флаг ai_enabled И оплаченный ai_until >= today."""
+    if not profile:
+        return False
+    try:
+        flag = int(_dget(profile, "ai_enabled", 0) or 0)
+    except (TypeError, ValueError):
+        flag = 0
+    return flag == 1 and _date_active(_dget(profile, "ai_until", None), today)
+
+
+def format_subscription(profile: Any, settings_obj: Settings, today: str) -> str:
+    """Текст /subscription: статус base/ai, даты и цены."""
+    profile = profile or {}
+    sub_until = _dget(profile, "sub_until", None)
+    ai_until = _dget(profile, "ai_until", None)
+    base_on = _date_active(sub_until, today)
+    ai_on = _date_active(ai_until, today)
+
+    def _fmt(value: Any) -> str:
+        return str(value)[:10] if value else "—"
+
+    base_line = (
+        f"✅ активна до <b>{_fmt(sub_until)}</b>" if base_on
+        else "❌ не активна"
+    )
+    ai_line = (
+        f"✅ активен до <b>{_fmt(ai_until)}</b>" if ai_on
+        else "❌ не подключён"
+    )
+    lines = [
+        "💳 <b>Подписка Vita Ratio</b>",
+        "",
+        f"Бот и приложение: {base_line}",
+        f"ИИ-разбор: {ai_line}",
+        "",
+        (
+            f"Подписка — <b>{settings_obj.base_price_rub} ₽/мес</b> "
+            f"({settings_obj.base_price_stars} Stars), "
+            f"ИИ — <b>+{settings_obj.ai_price_rub} ₽/мес</b> "
+            f"({settings_obj.ai_price_stars} Stars)."
+        ),
+        f"Оплата в Telegram Stars, период {settings_obj.sub_period_days} дней.",
+        "Новым пользователям — пробный период "
+        f"{settings_obj.trial_days} дней.",
+    ]
+    if not base_on:
+        lines.append("")
+        lines.append("ИИ-аддон доступен после оформления подписки.")
+    return "\n".join(lines)
+
+
+
+def _payment_until(payment: Any, current: Any, today: str, settings_obj: Settings) -> str:
+    """Дата окончания после оплаты: ``subscription_expiration_date`` либо +период.
+
+    Без даты от Telegram продлеваем от максимума из «today» и текущей даты —
+    так оплата не «съедает» остаток и не продлевает уже истёкшую подписку назад.
+    """
+    expiration = getattr(payment, "subscription_expiration_date", None)
+    try:
+        if expiration:
+            return date_cls.fromtimestamp(int(expiration)).isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        log.warning("Некорректный subscription_expiration_date=%r — считаю по периоду", expiration)
+    base = date_cls.fromisoformat(str(today)[:10])
+    current_day = _parse_short_date(current)
+    if current_day is not None and current_day > base:
+        base = current_day
+    period = max(int(getattr(settings_obj, "sub_period_days", 30) or 30), 1)
+    return (base + timedelta(days=period)).isoformat()
+
+
+def _payment_text(kind: str, until: str, duplicate: bool = False) -> str:
+    """Текст подтверждения оплаты в чат (CONTRACT §24)."""
+    if duplicate:
+        return "✅ Платёж уже учтён — подписка не продлевается повторно."
+    if kind == "ai":
+        return f"✅ ИИ-разбор подключён до {until}"
+    return f"✅ Подписка на Vita Ratio активна до {until}"
+
+
+def apply_payment(
+    settings_obj: Settings,
+    conn: sqlite3.Connection,
+    payment: Any,
+    user_id: int | None = None,
+) -> dict:
+    """Обрабатывает ``successful_payment``: запись платежа + продление подписки.
+
+    Идемпотентно по ``telegram_payment_charge_id``: повторная доставка того же
+    платежа не продлевает подписку второй раз. Возвращает dict со статусом для
+    ответа в чат: ``{"ok", "kind", "until", "duplicate", "user_id", "error", "text"}``.
+    """
+    charge_id = str(getattr(payment, "telegram_payment_charge_id", "") or "").strip()
+    raw_payload = str(getattr(payment, "invoice_payload", "") or "").strip()
+    kind, _, uid_text = raw_payload.partition(":")
+    kind = kind.strip().lower()
+    try:
+        payload_uid = int(uid_text) if uid_text else 0
+    except (TypeError, ValueError):
+        payload_uid = 0
+    uid = int(user_id or payload_uid or 0)
+    error = ""
+    if kind not in store.PAYMENT_KINDS or uid <= 0 or not charge_id:
+        error = "bad_payload"
+    profile = None
+    if not error:
+        store.upsert_user(conn, uid)
+        profile = get_profile(conn, uid)
+        if profile is None:
+            error = "no_profile"
+    if error:
+        log.warning(
+            "successful_payment: не обработан (%s): payload=%r charge=%r uid=%s",
+            error, raw_payload, charge_id, uid,
+        )
+        return {
+            "ok": False,
+            "kind": kind,
+            "until": None,
+            "duplicate": False,
+            "user_id": uid,
+            "error": error,
+            "text": "",
+        }
+
+    amount = int(getattr(payment, "total_amount", 0) or 0)
+    currency = str(getattr(payment, "currency", "XTR") or "XTR")
+    field = "ai_until" if kind == "ai" else "sub_until"
+    current = _dget(profile, field, None)
+    inserted = store.add_payment(conn, uid, kind, charge_id, amount, currency, raw_payload)
+    if not inserted:
+        log.info(
+            "successful_payment: платёж %s уже был (user_id=%s kind=%s) — подписка не продлена",
+            charge_id, uid, kind,
+        )
+        return {
+            "ok": True,
+            "kind": kind,
+            "until": current,
+            "duplicate": True,
+            "user_id": uid,
+            "error": "",
+            "text": _payment_text(kind, str(current or ""), duplicate=True),
+        }
+
+    today = calc.local_today(settings_obj.timezone)
+    until = _payment_until(payment, current, today, settings_obj)
+    store.set_subscription(conn, uid, **{field: until})
+    if kind == "ai":
+        # Аддон оплачен -> включаем ИИ в профиле (CONTRACT §22).
+        store.upsert_profile(conn, uid, {"ai_enabled": 1})
+    text = _payment_text(kind, until)
+    log.info(
+        "successful_payment: user_id=%s kind=%s until=%s charge=%s amount=%s %s",
+        uid, kind, until, charge_id, amount, currency,
+    )
+    return {
+        "ok": True,
+        "kind": kind,
+        "until": until,
+        "duplicate": False,
+        "user_id": uid,
+        "error": "",
+        "text": text,
+    }
 
 
 def _token_file() -> Path:
@@ -648,6 +848,49 @@ def build_targets(conn: sqlite3.Connection, user_id: int) -> str:
     return format_targets(targets_for_profile(profile))
 
 
+# --- оплата: ссылки и клавиатура ------------------------------------------------
+
+async def invoice_urls(settings_obj: Settings, user_id: int, base_active: bool) -> dict[str, str]:
+    """Создаёт ссылки на оплату (base всегда, ai — только при активной base).
+
+    Использует ту же функцию Bot API, что и ``POST /api/pay/invoice``; ошибки
+    только логируются, чтобы статус /subscription не падал без сети.
+    """
+    from .api import create_invoice_link  # локальный импорт: без цикла api <-> bot
+
+    urls: dict[str, str] = {}
+    kinds = ["base", "ai"] if base_active else ["base"]
+    for kind in kinds:
+        try:
+            data = await create_invoice_link(settings_obj, int(user_id), kind)
+            urls[kind] = str(data["invoice_url"])
+        except Exception as exc:  # noqa: BLE001 — сеть/Bot API: кнопка просто не появится
+            log.warning("invoice: не удалось создать ссылку %s для %s: %s", kind, user_id, exc)
+    return urls
+
+
+def subscription_markup(
+    settings_obj: Settings, urls: dict[str, str]
+) -> InlineKeyboardMarkup | None:
+    """Inline-кнопки «Оплатить N ₽» / «Подключить ИИ +N ₽» со ссылками на invoice."""
+    rows: list[list[InlineKeyboardButton]] = []
+    if urls.get("base"):
+        rows.append([
+            InlineKeyboardButton(
+                text=f"Оплатить {settings_obj.base_price_rub} ₽", url=urls["base"]
+            )
+        ])
+    if urls.get("ai"):
+        rows.append([
+            InlineKeyboardButton(
+                text=f"Подключить ИИ +{settings_obj.ai_price_rub} ₽", url=urls["ai"]
+            )
+        ])
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 # --- хендлеры ------------------------------------------------------------------
 
 def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
@@ -667,6 +910,64 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
             reply_markup=markup,
             disable_web_page_preview=True,
         )
+
+    async def require_base(message: Message) -> bool:
+        """Гейт команд: True — можно выполнять; иначе отправлен paywall."""
+        if not (settings_obj.subscription_enforced and not settings_obj.is_dev):
+            return True
+        user_id = user_id_of(message)
+        try:
+            profile = get_profile(conn, user_id)
+        except sqlite3.Error:
+            log.exception("Не удалось прочитать профиль для гейта (user_id=%s)", user_id)
+            profile = None
+        today = calc.local_today(default_tz)
+        if subscription_active(profile, today):
+            return True
+        urls = await invoice_urls(settings_obj, user_id, base_active=False)
+        await answer(message, PAYWALL_TEXT, subscription_markup(settings_obj, urls))
+        return False
+
+    async def send_subscription(message: Message) -> None:
+        """Статус подписки + inline-кнопки оплаты base/ai (CONTRACT §24)."""
+        user_id = user_id_of(message)
+        try:
+            profile = get_profile(conn, user_id)
+        except sqlite3.Error:
+            log.exception("Не удалось прочитать профиль для /subscription (user_id=%s)", user_id)
+            profile = None
+        today = calc.local_today(default_tz)
+        text = format_subscription(profile, settings_obj, today)
+        urls = await invoice_urls(
+            settings_obj, user_id, base_active=subscription_active(profile, today)
+        )
+        if not urls:
+            text += "\n\n⚠️ Не удалось создать ссылку на оплату — попробуй позже."
+        await answer(message, text, subscription_markup(settings_obj, urls))
+
+    @router.pre_checkout_query()
+    async def on_pre_checkout(query: PreCheckoutQuery) -> None:
+        """Telegram требует подтвердить pre_checkout_query (CONTRACT §24)."""
+        await query.answer(ok=True)
+
+    @router.message(F.successful_payment)
+    async def on_successful_payment(message: Message) -> None:
+        """Оплата Stars: продлевает подписку и подтверждает в чате."""
+        payment = message.successful_payment
+        try:
+            result = apply_payment(settings_obj, conn, payment, user_id_of(message))
+        except Exception:  # noqa: BLE001 — платёж не должен ронять polling
+            log.exception("Ошибка обработки successful_payment (user_id=%s)", user_id_of(message))
+            await message.answer("😔 Оплата получена, но не удалось обновить подписку. Напиши в поддержку.")
+            return
+        if not result["ok"]:
+            return
+        markup = open_app_keyboard(settings_obj.app_url) if result["kind"] == "base" else None
+        await answer(message, result["text"], markup)
+
+    @router.message(Command("subscription"))
+    async def cmd_subscription(message: Message) -> None:
+        await send_subscription(message)
 
     @router.message(Command("start"))
     async def cmd_start(message: Message) -> None:
@@ -710,6 +1011,8 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
 
     @router.message(Command("today"))
     async def cmd_today(message: Message) -> None:
+        if not await require_base(message):
+            return
         try:
             text = build_today(conn, user_id_of(message), default_tz)
         except sqlite3.Error:
@@ -719,6 +1022,8 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
 
     @router.message(Command("plan"))
     async def cmd_plan(message: Message) -> None:
+        if not await require_base(message):
+            return
         try:
             text = build_plan(conn, user_id_of(message), default_tz)
         except sqlite3.Error:
@@ -728,6 +1033,8 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
 
     @router.message(Command("classes"))
     async def cmd_classes(message: Message) -> None:
+        if not await require_base(message):
+            return
         try:
             text = build_classes(conn, user_id_of(message), default_tz)
         except sqlite3.Error:
@@ -737,6 +1044,8 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
 
     @router.message(Command("sleep"))
     async def cmd_sleep(message: Message) -> None:
+        if not await require_base(message):
+            return
         try:
             text = build_sleep(conn, user_id_of(message))
         except sqlite3.Error:
@@ -746,6 +1055,8 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
 
     @router.message(Command("targets"))
     async def cmd_targets(message: Message) -> None:
+        if not await require_base(message):
+            return
         try:
             text = build_targets(conn, user_id_of(message))
         except sqlite3.Error:
@@ -755,15 +1066,21 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
 
     @router.message(Command("export"))
     async def cmd_export(message: Message) -> None:
+        if not await require_base(message):
+            return
         parts = (message.text or "").split()[1:]
         period = next((p.lower() for p in parts if p.lower() in reports.PERIODS), "day")
         fmt = next((p.lower() for p in parts if p.lower() in ("png", "docx", "xlsx")), "png")
+        user_id = user_id_of(message)
         await message.answer("⏳ Собираю отчёт…")
         try:
+            profile = get_profile(conn, user_id)
+            today = calc.local_today(default_tz)
+            use_llm = effective_ai(profile, today)
             filename, payload = await asyncio.to_thread(
-                reports.build, conn, user_id_of(message), period, fmt)
+                reports.build, conn, user_id, period, fmt, use_llm=use_llm)
         except Exception:
-            log.exception("Ошибка /export для user_id=%s", user_id_of(message))
+            log.exception("Ошибка /export для user_id=%s", user_id)
             await message.answer("😔 Не получилось собрать отчёт. Попробуй ещё раз чуть позже.")
             return
         await message.answer_document(
@@ -773,6 +1090,8 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
 
     @router.message(Command("note"))
     async def cmd_note(message: Message) -> None:
+        if not await require_base(message):
+            return
         text = (message.text or "").partition(" ")[2].strip()
         if not text:
             await message.answer("✍️ Напиши так: <code>/note сегодня тяжело, мало спал</code>")
@@ -780,7 +1099,11 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
         user_id = user_id_of(message)
         try:
             profile = get_profile(conn, user_id)
-            ai_enabled = profile is not None and int(_dget(profile, "ai_enabled", 0) or 0) == 1
+            today = calc.local_today(
+                _profile_tz(profile, default_tz) if profile else default_tz
+            )
+            # v5: ИИ работает только при оплаченном ai_until (CONTRACT §22–24).
+            ai_enabled = effective_ai(profile, today)
             reply = await asyncio.to_thread(
                 reports.save_note, conn, user_id, text, None, ai_enabled
             )
@@ -788,18 +1111,20 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
             log.exception("Ошибка /note для user_id=%s", user_id)
             await message.answer("😔 Не получилось сохранить заметку. Попробуй ещё раз чуть позже.")
             return
-        if profile is not None and not ai_enabled:
-            # ИИ-разбор выключен в профиле: заметка сохранена, модель не вызывалась.
+        if not ai_enabled:
+            # ИИ-разбор выключен/не оплачен: заметка сохранена, модель не вызывалась.
             await answer(
                 message,
-                "📝 Заметка сохранена. ИИ-разбор выключен — включи в приложении: "
-                "Прогресс → Заметки и ИИ",
+                "📝 Заметка сохранена. ИИ-разбор не подключён — "
+                "ИИ +100 ₽/мес: /subscription",
             )
             return
         await answer(message, "📝 <b>Заметка сохранена.</b>\n\n🤖 <b>ИИ-разбор:</b>\n" + _esc(reply))
 
     @router.message(Command("notes"))
     async def cmd_notes(message: Message) -> None:
+        if not await require_base(message):
+            return
         try:
             rows = await asyncio.to_thread(reports.last_notes, conn, user_id_of(message))
         except Exception:
@@ -903,6 +1228,7 @@ async def _set_commands(bot: Bot) -> None:
             BotCommand(command="export", description="Отчёт: день/неделя/месяц (png, docx, xlsx)"),
             BotCommand(command="note", description="Заметка с разбором ИИ"),
             BotCommand(command="notes", description="Последние заметки и ответы ИИ"),
+            BotCommand(command="subscription", description="Подписка и оплата (Stars)"),
             BotCommand(command="help", description="Список команд"),
         ])
     except TelegramAPIError as exc:

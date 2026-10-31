@@ -12,13 +12,15 @@ import logging
 import math
 import os
 import re
+import uuid
 from datetime import date as date_cls
 from datetime import timedelta
 from pathlib import Path
 
+import aiohttp
 from aiohttp import web
 
-from . import __version__, auth, calc, foods, notify, reports, store
+from . import __version__, auth, calc, foods, notify, payments, reports, store
 
 log = logging.getLogger("vita_ratio.api")
 
@@ -64,6 +66,99 @@ _HTTP_ERRORS = {
     500: ("internal_error", "Внутренняя ошибка сервера"),
 }
 
+# --- подписка (CONTRACT §22–23) --------------------------------------------------
+#: API-пути, доступные без активной base-подписки.
+SUBSCRIPTION_FREE_PATHS = frozenset({
+    "/api/health",
+    "/api/bootstrap",
+    "/api/subscription",
+    "/api/pay/invoice",
+    "/api/pay/refresh",
+    # Вебхуки эквайринга: публичные, подлинность проверяется провайдером.
+    "/api/pay/yookassa",
+    "/api/pay/robokassa/result",
+    "/api/pay/robokassa/success",
+})
+#: URL Bot API для создания ссылки на оплату Telegram Stars.
+INVOICE_API_URL = "https://api.telegram.org/bot{token}/createInvoiceLink"
+
+
+def _is_date_active(value, today: str) -> bool:
+    """Дата ``until`` действует по сегодня включительно (ISO ``YYYY-MM-DD``)."""
+    if not value:
+        return False
+    try:
+        return date_cls.fromisoformat(str(value)[:10]) >= date_cls.fromisoformat(str(today)[:10])
+    except (TypeError, ValueError):
+        return False
+
+
+def subscription_active(profile: dict | None, today: str) -> bool:
+    """Активна ли base-подписка (дата включительно)."""
+    return _is_date_active((profile or {}).get("sub_until"), today)
+
+
+def ai_active(profile: dict | None, today: str) -> bool:
+    """Активен ли ИИ-аддон (дата включительно)."""
+    return _is_date_active((profile or {}).get("ai_until"), today)
+
+
+def effective_ai(profile: dict | None, today: str) -> bool:
+    """Эффективный ИИ: флаг включён пользователем И оплачен до сегодня."""
+    return bool((profile or {}).get("ai_enabled")) and ai_active(profile, today)
+
+
+def gate_enabled(settings_obj) -> bool:
+    """Платный режим реально включён: enforced и это не dev-среда."""
+    return bool(settings_obj.subscription_enforced) and not settings_obj.is_dev
+
+
+def subscription_gate(
+    settings_obj,
+    path: str,
+    profile: dict | None,
+    today: str,
+    ai_required: bool = False,
+) -> "ApiError | None":
+    """Чистая проверка гейта: ``None`` — доступ есть, иначе :class:`ApiError` 402.
+
+    Пропускает не-API пути (статика/мини-приложение) и белый список §23.
+    Новый пользователь без профиля может создать его (онбординг) и получить триал —
+    иначе триал, создаваемый вместе с профилем, был бы недостижим.
+    """
+    if not gate_enabled(settings_obj):
+        return None
+    if not str(path).startswith("/api/"):
+        return None
+    if path in SUBSCRIPTION_FREE_PATHS:
+        return None
+    if path == "/api/profile" and profile is None:
+        return None
+    if not subscription_active(profile, today):
+        return ApiError(402, "subscription_required", "Подписка 250 ₽/мес нужна для доступа")
+    if ai_required and not ai_active(profile, today):
+        return ApiError(402, "ai_subscription_required", "ИИ +100 ₽/мес — подключите для доступа")
+    return None
+
+
+def _subscription_json(profile: dict | None, settings_obj, today: str) -> dict:
+    """Ответ GET /api/subscription и статусы подписки для bootstrap/profile."""
+    profile = profile or {}
+    return {
+        "active": subscription_active(profile, today),
+        "until": profile.get("sub_until") or None,
+        "ai_active": ai_active(profile, today),
+        "ai_until": profile.get("ai_until") or None,
+        "ai_enabled": effective_ai(profile, today),
+        "base_price_rub": int(settings_obj.base_price_rub),
+        "base_price_stars": int(settings_obj.base_price_stars),
+        "ai_price_rub": int(settings_obj.ai_price_rub),
+        "ai_price_stars": int(settings_obj.ai_price_stars),
+        "period_days": int(settings_obj.sub_period_days),
+        "trial_days": int(settings_obj.trial_days),
+        "enforced": gate_enabled(settings_obj),
+    }
+
 
 class ApiError(Exception):
     """Ошибка API с HTTP-статусом и машиночитаемым кодом."""
@@ -97,6 +192,107 @@ def json_error(status: int, code: str, message: str | None = None) -> web.Respon
         content_type="application/json",
         charset="utf-8",
     )
+
+
+# --- платежи Telegram Stars ------------------------------------------------------
+
+def invoice_product(settings_obj, kind: str) -> dict:
+    """Описание продукта для Bot API: title, description, price_stars, price_rub."""
+    kind = str(kind or "").strip().lower()
+    days = max(int(getattr(settings_obj, "sub_period_days", 30) or 30), 1)
+    if kind == "base":
+        return {
+            "kind": "base",
+            "title": "Vita Ratio — подписка",
+            "description": f"Доступ к боту и мини-приложению Vita Ratio на {days} дн.",
+            "price_stars": int(settings_obj.base_price_stars),
+            "price_rub": int(settings_obj.base_price_rub),
+            "period_days": days,
+        }
+    if kind == "ai":
+        return {
+            "kind": "ai",
+            "title": "Vita Ratio — ИИ-разбор",
+            "description": f"ИИ-разбор заметок и отчётов Vita Ratio на {days} дн.",
+            "price_stars": int(settings_obj.ai_price_stars),
+            "price_rub": int(settings_obj.ai_price_rub),
+            "period_days": days,
+        }
+    raise ApiError(400, "bad_request", "Поле «kind» должно быть base или ai")
+
+
+async def create_invoice_link(settings_obj, user_id: int, kind: str) -> dict:
+    """Создаёт ссылку на оплату через Bot API ``createInvoiceLink`` (XTR, рекуррентно).
+
+    Возвращает ``{"invoice_url", "kind", "price_stars", "price_rub", "period_days"}``.
+    Ошибки Bot API/сети — ``502 invoice_failed`` (CONTRACT §23).
+    """
+    product = invoice_product(settings_obj, kind)
+    token = (getattr(settings_obj, "bot_token", "") or "").strip()
+    if not token:
+        raise ApiError(502, "invoice_failed", "no bot token")
+    uid = int(user_id)
+    body = {
+        "title": product["title"],
+        "description": product["description"],
+        "payload": f"{product['kind']}:{uid}",
+        "currency": "XTR",
+        "prices": [{"label": product["title"], "amount": product["price_stars"]}],
+        "subscription_period": product["period_days"] * 86400,
+    }
+    url = INVOICE_API_URL.format(token=token)
+    status = 0
+    payload = None
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=body) as response:
+                status = int(response.status)
+                try:
+                    payload = await response.json(content_type=None)
+                except Exception:  # noqa: BLE001 — не-JSON ответ Bot API
+                    payload = None
+    except Exception as exc:  # noqa: BLE001 — сеть/таймаут/прокси: 502 по контракту
+        log.warning("invoice: Bot API недоступен (%s: %s)", type(exc).__name__, str(exc)[:200])
+        raise ApiError(502, "invoice_failed", f"Bot API: {type(exc).__name__}") from None
+    if status >= 400 or not isinstance(payload, dict) or not payload.get("ok"):
+        description = ""
+        if isinstance(payload, dict):
+            description = str(payload.get("description") or "")[:200]
+        log.warning("invoice: Bot API ответил %s: %s", status, description or payload)
+        raise ApiError(502, "invoice_failed", description or "Bot API error")
+    invoice_url = payload.get("result")
+    if not invoice_url:
+        raise ApiError(502, "invoice_failed", "Bot API не вернул ссылку на оплату")
+    return {
+        "invoice_url": str(invoice_url),
+        "kind": product["kind"],
+        "price_stars": product["price_stars"],
+        "price_rub": product["price_rub"],
+        "period_days": product["period_days"],
+    }
+
+
+@web.middleware
+async def subscription_middleware(request: web.Request, handler) -> web.StreamResponse:
+    """Гейт платного режима: без активной base-подписки — 402 на ``/api/*``.
+
+    Включается только при ``subscription_enforced`` и вне dev. Статика и ``/``
+    не проверяются, чтобы paywall-экран мини-приложения открывался.
+    """
+    settings_obj = _settings(request)
+    if not gate_enabled(settings_obj):
+        return await handler(request)
+    path = request.path
+    if not path.startswith("/api/") or path in SUBSCRIPTION_FREE_PATHS:
+        return await handler(request)
+    user = auth.authenticate(request, settings_obj)
+    profile = store.get_profile(_conn(request), user["id"])
+    today = calc.local_today(settings_obj.timezone)
+    error = subscription_gate(settings_obj, path, profile, today)
+    if error is not None:
+        raise error
+    return await handler(request)
 
 
 @web.middleware
@@ -292,9 +488,10 @@ def _user_json(user: dict) -> dict:
     }
 
 
-def _profile_json(profile: dict | None) -> dict | None:
+def _profile_json(profile: dict | None, today: str | None = None) -> dict | None:
     if not profile:
         return None
+    day = today or calc.local_today()
     return {
         "sex": profile.get("sex"),
         "age": int(profile.get("age") or 0),
@@ -306,7 +503,9 @@ def _profile_json(profile: dict | None) -> dict | None:
         "sleep_bed": profile.get("sleep_bed"),
         "sleep_wake": profile.get("sleep_wake"),
         "reminders": bool(profile.get("reminders")),
-        "ai_enabled": bool(profile.get("ai_enabled")),
+        "ai_enabled": effective_ai(profile, day),
+        "sub_until": profile.get("sub_until") or None,
+        "ai_until": profile.get("ai_until") or None,
         "timezone": profile.get("timezone"),
         "goal_weight_kg": (
             _number(profile.get("goal_weight_kg"))
@@ -794,8 +993,14 @@ async def health(request: web.Request) -> web.Response:
 
 async def get_profile(request: web.Request) -> web.Response:
     user = _user(request)
+    settings = _settings(request)
     profile = store.get_profile(_conn(request), user["id"])
-    return json_ok({"profile": _profile_json(profile), "targets": _targets_json(profile)})
+    today = calc.local_today(settings.timezone)
+    return json_ok({
+        "profile": _profile_json(profile, today),
+        "targets": _targets_json(profile),
+        "subscription": _subscription_json(profile, settings, today),
+    })
 
 
 async def put_profile(request: web.Request) -> web.Response:
@@ -806,6 +1011,11 @@ async def put_profile(request: web.Request) -> web.Response:
     existing = store.get_profile(conn, user["id"])
     data = _profile_payload(payload, settings, existing)
     profile = store.upsert_profile(conn, user["id"], data)
+    today = calc.local_today(settings.timezone)
+    if existing is None:
+        # Новый профиль получает триал (CONTRACT §22): sub_until = today + TRIAL_DAYS.
+        store.ensure_trial(conn, user["id"], settings.trial_days, today=today)
+        profile = store.get_profile(conn, user["id"]) or profile
     targets = _targets_obj(profile).to_dict()
     if existing is None:
         # Первый профиль = онбординг завершён: поздравительное сообщение в чат.
@@ -816,7 +1026,11 @@ async def put_profile(request: web.Request) -> web.Response:
             task.add_done_callback(_log_notify_result)
         except RuntimeError:  # нет running loop (например, в тестах)
             pass
-    return json_ok({"profile": _profile_json(profile), "targets": targets})
+    return json_ok({
+        "profile": _profile_json(profile, today),
+        "targets": targets,
+        "subscription": _subscription_json(profile, settings, today),
+    })
 
 
 def _log_notify_result(task) -> None:
@@ -1189,37 +1403,39 @@ async def post_weight(request: web.Request) -> web.Response:
     )
 
 
-# --- заметки и ИИ (v4) ----------------------------------------------------------
+# --- заметки и ИИ (v4/v5) --------------------------------------------------------
 
-def _ai_enabled(profile: dict | None) -> bool:
-    """Флаг ИИ-разбора из профиля; без профиля — выключен."""
-    return bool(profile and profile.get("ai_enabled"))
+def _ai_enabled(profile: dict | None, today: str) -> bool:
+    """Эффективный ИИ: флаг включён и аддон ai оплачен до сегодня (CONTRACT §22)."""
+    return effective_ai(profile, today)
 
 
 async def get_notes(request: web.Request) -> web.Response:
     """Последние заметки (новые сверху) + текущее состояние ИИ-разбора."""
     user = _user(request)
+    settings = _settings(request)
     conn = _conn(request)
     limit = _query_int(request, "limit", 30, 1, 100)
     profile = store.get_profile(conn, user["id"])
+    today = calc.local_today(settings.timezone)
     return json_ok(
         {
             "notes": [_note_json(row) for row in store.list_notes(conn, user["id"], limit)],
-            "ai_enabled": _ai_enabled(profile),
+            "ai_enabled": _ai_enabled(profile, today),
         }
     )
 
 
 async def post_note(request: web.Request) -> web.Response:
-    """Сохраняет заметку за сегодня; ИИ-разбор только если включён в профиле."""
+    """Сохраняет заметку за сегодня; ИИ-разбор только при оплаченном ai_until."""
     user = _user(request)
     settings = _settings(request)
     conn = _conn(request)
     payload = await _body(request)
     text = _text_value(payload.get("text"), "text", 2000, required=True)
     profile = store.get_profile(conn, user["id"])
-    ai_enabled = _ai_enabled(profile)
     today = calc.local_today(settings.timezone)
+    ai_enabled = _ai_enabled(profile, today)
     # Модель может думать до 20 с — не блокируем event loop.
     await asyncio.to_thread(
         reports.save_note, conn, user["id"], text, today, ai_enabled=ai_enabled
@@ -1231,15 +1447,28 @@ async def post_note(request: web.Request) -> web.Response:
 
 
 async def put_ai(request: web.Request) -> web.Response:
-    """Включает/выключает ИИ-разбор заметок (флаг profiles.ai_enabled)."""
+    """Включает/выключает ИИ-разбор заметок (флаг profiles.ai_enabled).
+
+    В платном режиме включение требует активного аддона ``ai_until``
+    (402 ``ai_subscription_required``); выключение доступно всегда.
+    """
     user = _user(request)
+    settings = _settings(request)
     conn = _conn(request)
     payload = await _body(request)
     enabled = payload.get("enabled")
     if not isinstance(enabled, bool):
         raise _bad("Поле «enabled» должно быть true или false")
+    today = calc.local_today(settings.timezone)
+    profile = store.get_profile(conn, user["id"])
+    if enabled and gate_enabled(settings) and not ai_active(profile, today):
+        raise ApiError(
+            402,
+            "ai_subscription_required",
+            "ИИ +100 ₽/мес — подключите для доступа",
+        )
     profile = store.upsert_profile(conn, user["id"], {"ai_enabled": 1 if enabled else 0})
-    return json_ok({"ai_enabled": bool(profile.get("ai_enabled"))})
+    return json_ok({"ai_enabled": _ai_enabled(profile, today)})
 
 
 # --- недельный чек-ин -----------------------------------------------------------
@@ -1295,7 +1524,7 @@ async def post_weekly(request: web.Request) -> web.Response:
     return json_ok(
         {
             "checkin": _checkin_json(checkin),
-            "profile": _profile_json(profile),
+            "profile": _profile_json(profile, day),
             "targets": _targets_json(profile),
             "goal": _goal_payload(conn, user["id"], profile, day, trend),
         }
@@ -1515,7 +1744,10 @@ async def get_bootstrap(request: web.Request) -> web.Response:
         "user": _user_json(user),
         "profile": None,
         "targets": None,
-        "ai_enabled": _ai_enabled(profile),
+        "ai_enabled": _ai_enabled(profile, day),
+        "sub_until": (profile or {}).get("sub_until") or None,
+        "ai_until": (profile or {}).get("ai_until") or None,
+        "subscription": _subscription_json(profile, settings, day),
         "goal": _goal_payload(
             conn, user["id"], profile, day, stats["trend_kg_per_week"]
         ),
@@ -1549,7 +1781,7 @@ async def get_bootstrap(request: web.Request) -> web.Response:
             1 for item in classes_today if item.get("status") == "present"
         )
         sleep_h = sleep_row["duration_h"] if sleep_row else None
-        data["profile"] = _profile_json(profile)
+        data["profile"] = _profile_json(profile, day)
         data["targets"] = targets_obj.to_dict()
         data["today"] = {
             "date": day,
@@ -1602,16 +1834,389 @@ async def static_file(request: web.Request) -> web.Response:
     return _serve_file(settings.webapp_dir / filename)
 
 
+# --- подписка и оплата (v5, CONTRACT §23) ---------------------------------------
+
+async def get_subscription(request: web.Request) -> web.Response:
+    """GET /api/subscription — статусы base/ai, даты, цены и режим оплаты."""
+    user = _user(request)
+    settings_obj = _settings(request)
+    conn = _conn(request)
+    profile = store.get_profile(conn, user["id"])
+    today = calc.local_today(settings_obj.timezone)
+    return json_ok(_subscription_json(profile, settings_obj, today))
+
+
+async def post_pay_invoice(request: web.Request) -> web.Response:
+    """POST /api/pay/invoice {"kind":"base"|"ai"} — ссылка на оплату.
+
+    Если настроен рублёвый эквайринг (``PAY_PROVIDER=yookassa|robokassa`` и
+    ключи), создаётся счёт провайдера и возвращается его ``invoice_url``.
+    Иначе — прежний счёт Telegram Stars (``createInvoiceLink``).
+    """
+    user = _user(request)
+    settings_obj = _settings(request)
+    conn = _conn(request)
+    payload = await _body(request)
+    kind = str(payload.get("kind") or "").strip().lower()
+    if kind not in ("base", "ai"):
+        raise _bad("Поле «kind» должно быть base или ai")
+    if kind == "ai":
+        profile = store.get_profile(conn, user["id"])
+        today = calc.local_today(settings_obj.timezone)
+        if not subscription_active(profile, today):
+            raise ApiError(409, "base_required", "Сначала оформите подписку 250 ₽/мес")
+    if payments.provided(settings_obj):
+        try:
+            data = _create_rub_invoice(conn, settings_obj, user["id"], kind)
+        except ApiError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — сеть/БД/провайдер: единый код 502
+            log.exception(
+                "invoice: провайдер %s не создал счёт", getattr(settings_obj, "pay_provider", "?")
+            )
+            raise ApiError(
+                502, "invoice_failed", f"{type(exc).__name__}: {str(exc)[:120]}"
+            ) from None
+        return json_ok(data)
+    return json_ok(await create_invoice_link(settings_obj, user["id"], kind))
+
+
+# --- рублёвый эквайринг: счета, вебхуки, refresh (v6) ---------------------------
+
+def _rub_invoice_json(invoice_url, provider: str, kind: str, price_rub, settings_obj) -> dict:
+    """Единый ответ POST /api/pay/invoice для рублёвого пути."""
+    return {
+        "invoice_url": str(invoice_url),
+        "provider": str(provider),
+        "kind": str(kind),
+        "price_rub": int(price_rub),
+        "price_stars": 0,
+        "period_days": int(getattr(settings_obj, "sub_period_days", 30) or 30),
+    }
+
+
+def _create_rub_invoice(conn, settings_obj, user_id: int, kind: str) -> dict:
+    """Создаёт счёт у настроенного провайдера (ЮKassa/Robokassa).
+
+    ЮKassa: платёж создаётся сразу, его id — ``external_id`` счёта.
+    Robokassa: сначала строка с ``tmp-<uuid>`` (нужен id для подписи), затем
+    подписанная ссылка с InvId = id строки, после чего ``external_id``
+    переписывается на ``str(id)``.
+    """
+    provider = str(getattr(settings_obj, "pay_provider", "") or "").strip().lower()
+    amount = int(payments.rub_price(settings_obj, kind))
+    if provider == "robokassa":
+        row_id = store.create_invoice(
+            conn,
+            user_id,
+            kind,
+            "robokassa",
+            f"tmp-{uuid.uuid4()}",
+            amount,
+            payload="robokassa",
+        )
+        created = payments.robokassa_url(settings_obj, user_id, kind, invoice_id=row_id)
+        invoice_url = str(created.get("invoice_url") or "")
+        if not invoice_url:
+            raise RuntimeError("robokassa: пустая ссылка на оплату")
+        store.update_invoice_external(conn, row_id, str(row_id))
+        return _rub_invoice_json(
+            invoice_url, "robokassa", kind, created.get("price_rub", amount), settings_obj
+        )
+    created = payments.create_yookassa(settings_obj, user_id, kind)
+    invoice_url = str(created.get("invoice_url") or "")
+    external_id = str(created.get("external_id") or "").strip()
+    if not invoice_url or not external_id:
+        raise RuntimeError("yookassa: нет invoice_url/external_id")
+    store.create_invoice(
+        conn,
+        user_id,
+        kind,
+        "yookassa",
+        external_id,
+        created.get("price_rub", amount),
+        payload="yookassa",
+    )
+    return _rub_invoice_json(
+        invoice_url, "yookassa", kind, created.get("price_rub", amount), settings_obj
+    )
+
+
+def _payment_until(conn, settings_obj, user_id: int, kind: str) -> str:
+    """Новая дата подписки: max(сегодня, текущая) + period_days."""
+    today = date_cls.fromisoformat(calc.local_today(settings_obj.timezone))
+    field = "ai_until" if kind == "ai" else "sub_until"
+    current_raw = (store.get_subscription(conn, user_id) or {}).get(field)
+    current = None
+    if current_raw:
+        try:
+            current = date_cls.fromisoformat(str(current_raw)[:10])
+        except ValueError:
+            current = None
+    base = max(today, current) if current is not None else today
+    period = max(int(getattr(settings_obj, "sub_period_days", 30) or 30), 0)
+    return (base + timedelta(days=period)).isoformat()
+
+
+def _activate_provider_payment(
+    conn,
+    settings_obj,
+    user_id: int,
+    kind: str,
+    charge_id: str,
+    amount,
+    currency: str = "RUB",
+    payload: str = "",
+) -> dict:
+    """Пишет платёж и продлевает подписку (идемпотентно по ``charge_id``).
+
+    Возвращает ``{"ok", "duplicate", "user_id", "kind", "until", "error"}``.
+    Повторная доставка вебхука не продлевает подписку второй раз.
+    """
+    uid = int(user_id or 0)
+    normalized = str(kind or "").strip().lower()
+    charge = str(charge_id or "").strip()
+    if uid <= 0 or normalized not in store.PAYMENT_KINDS or not charge:
+        log.warning(
+            "activate: некорректный платёж uid=%s kind=%r charge=%r", uid, kind, charge
+        )
+        return {
+            "ok": False, "duplicate": False, "user_id": uid,
+            "kind": normalized, "until": None, "error": "bad_payload",
+        }
+    try:
+        amount_int = int(float(amount or 0))
+    except (TypeError, ValueError):
+        amount_int = 0
+    store.upsert_user(conn, uid)
+    if store.get_profile(conn, uid) is None:
+        # Профиля ещё нет (оплата до онбординга) — создаём, чтобы было куда
+        # записать sub_until/ai_until; платёж не теряется.
+        store.upsert_profile(conn, uid, {})
+    inserted = store.add_payment(
+        conn, uid, normalized, charge, amount_int, currency, payload
+    )
+    if not inserted:
+        log.info(
+            "activate: платёж %s уже учтён (user_id=%s kind=%s) — без продления",
+            charge, uid, normalized,
+        )
+        return {
+            "ok": True, "duplicate": True, "user_id": uid,
+            "kind": normalized, "until": None, "error": "",
+        }
+    until = _payment_until(conn, settings_obj, uid, normalized)
+    field = "ai_until" if normalized == "ai" else "sub_until"
+    store.set_subscription(conn, uid, **{field: until})
+    if normalized == "ai":
+        store.upsert_profile(conn, uid, {"ai_enabled": 1})
+    log.info(
+        "activate: user_id=%s kind=%s until=%s charge=%s amount=%s %s",
+        uid, normalized, until, charge, amount_int, currency,
+    )
+    return {
+        "ok": True, "duplicate": False, "user_id": uid,
+        "kind": normalized, "until": until, "error": "",
+    }
+
+
+async def post_pay_yookassa(request: web.Request) -> web.Response:
+    """POST /api/pay/yookassa — вебхук ЮKassa (без initData, всегда 200).
+
+    Тело: ``{"event": "payment.succeeded", "object": {"id": "<payment_id>"}}``.
+    Подлинность проверяется через API ЮKassa (``verify_yookassa``).
+    """
+    settings_obj = _settings(request)
+    conn = _conn(request)
+    try:
+        payload = await _body(request)
+    except (ApiError, web.HTTPException):
+        payload = {}
+    event = str(payload.get("event") or "").strip()
+    obj = payload.get("object")
+    obj = obj if isinstance(obj, dict) else {}
+    payment_id = str(obj.get("id") or "").strip()
+    if event != "payment.succeeded" or not payment_id:
+        log.info("yookassa webhook: событие %r id=%r пропущено", event, payment_id)
+        return web.json_response({"ok": True})
+    try:
+        verified = payments.verify_yookassa(settings_obj, payment_id)
+    except Exception:  # noqa: BLE001 — провайдеру всегда 200
+        log.exception("yookassa webhook: ошибка проверки платежа %s", payment_id)
+        return web.json_response({"ok": True})
+    if not verified:
+        log.warning("yookassa webhook: платёж %s не подтверждён", payment_id)
+        return web.json_response({"ok": True})
+
+    uid = int(verified.get("user_id") or 0)
+    kind = str(verified.get("kind") or "").strip().lower()
+    charge_id = str(verified.get("charge_id") or payment_id)
+    try:
+        amount = int(float(verified.get("amount") or 0))
+    except (TypeError, ValueError):
+        amount = 0
+
+    invoice = store.get_invoice_by_external(conn, payment_id)
+    if invoice is None and uid > 0 and kind in store.PAYMENT_KINDS:
+        # Счёт потерялся/создан не через API — восстанавливаем задним числом.
+        try:
+            store.upsert_user(conn, uid)
+            store.create_invoice(
+                conn,
+                uid,
+                kind,
+                "yookassa",
+                payment_id,
+                amount or payments.rub_price(settings_obj, kind),
+                payload="yookassa",
+            )
+            log.info("yookassa webhook: счёт %s создан задним числом", payment_id)
+        except Exception:  # noqa: BLE001 — гонка/повтор: счёт мог уже появиться
+            log.exception("yookassa webhook: не удалось создать счёт %s", payment_id)
+        invoice = store.get_invoice_by_external(conn, payment_id)
+    if invoice is not None:
+        uid = int(invoice.get("user_id") or 0)
+        kind = str(invoice.get("kind") or "").strip().lower()
+        if not amount:
+            try:
+                amount = int(float(invoice.get("amount_rub") or 0))
+            except (TypeError, ValueError):
+                amount = 0
+
+    try:
+        _activate_provider_payment(
+            conn, settings_obj, uid, kind, charge_id, amount, "RUB", "yookassa"
+        )
+        store.mark_invoice(conn, payment_id, "succeeded")
+    except Exception:  # noqa: BLE001 — ЮKassa не должна получать 500 и ретраить
+        log.exception("yookassa webhook: не удалось активировать платёж %s", payment_id)
+    return web.json_response({"ok": True})
+
+
+async def post_pay_robokassa_result(request: web.Request) -> web.Response:
+    """POST /api/pay/robokassa/result — ResultURL Robokassa (form-urlencoded).
+
+    Проверяет MD5-подпись (``verify_robokassa``), активирует счёт и отвечает
+    ``text/plain`` строкой ``OK{InvId}`` (требование Robokassa).
+    """
+    settings_obj = _settings(request)
+    conn = _conn(request)
+    try:
+        form = await request.post()
+    except Exception:  # noqa: BLE001 — битая форма: провайдер получит 400
+        log.exception("robokassa result: не удалось разобрать форму")
+        return web.Response(text="bad request", status=400, content_type="text/plain")
+    out_sum = str(form.get("OutSum") or "").strip()
+    inv_id = str(form.get("InvId") or "").strip()
+    signature = str(form.get("SignatureValue") or "").strip()
+    invoice_id = payments.verify_robokassa(settings_obj, out_sum, inv_id, signature)
+    if invoice_id is None:
+        log.warning(
+            "robokassa result: неверная подпись InvId=%r OutSum=%r", inv_id, out_sum
+        )
+        return web.Response(text="bad signature", status=400, content_type="text/plain")
+    invoice = store.get_invoice_by_external(conn, str(invoice_id))
+    if invoice is None:
+        log.warning("robokassa result: счёт InvId=%s не найден", invoice_id)
+        return web.Response(text="invoice not found", status=400, content_type="text/plain")
+    try:
+        amount = int(float(invoice.get("amount_rub") or 0))
+    except (TypeError, ValueError):
+        amount = 0
+    try:
+        _activate_provider_payment(
+            conn,
+            settings_obj,
+            invoice.get("user_id"),
+            invoice.get("kind"),
+            f"robokassa:{invoice_id}",
+            amount,
+            "RUB",
+            "robokassa",
+        )
+        store.mark_invoice(conn, str(invoice_id), "succeeded")
+    except Exception:  # noqa: BLE001 — 500 заставит Robokassa повторить вебхук
+        log.exception("robokassa result: не удалось активировать InvId=%s", invoice_id)
+        return web.Response(text="error", status=500, content_type="text/plain")
+    return web.Response(text=f"OK{inv_id}", content_type="text/plain")
+
+
+async def get_pay_robokassa_success(request: web.Request) -> web.Response:
+    """GET /api/pay/robokassa/success — страница «спасибо» после оплаты."""
+    return web.Response(
+        text=(
+            "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
+            "<title>Vita Ratio — оплата</title></head><body>"
+            "<p>Оплата прошла. Вернитесь в приложение.</p></body></html>"
+        ),
+        content_type="text/html",
+        charset="utf-8",
+    )
+
+
+async def post_pay_refresh(request: web.Request) -> web.Response:
+    """POST /api/pay/refresh {"kind": "base"|"ai"} — досрочная проверка счёта.
+
+    ЮKassa подтверждает платёж через API (вебхук может запаздывать), Robokassa —
+    только вебхуком, поэтому для неё просто возвращается текущий статус.
+    Ответ — как у GET /api/subscription.
+    """
+    user = _user(request)
+    settings_obj = _settings(request)
+    conn = _conn(request)
+    payload = await _body(request)
+    kind = str(payload.get("kind") or "").strip().lower()
+    if kind not in ("base", "ai"):
+        raise _bad("Поле «kind» должно быть base или ai")
+    invoice = store.find_pending_invoice(conn, user["id"], kind)
+    if invoice is not None and str(invoice.get("provider") or "") == "yookassa":
+        external_id = str(invoice.get("external_id") or "").strip()
+        verified = None
+        if external_id:
+            try:
+                verified = payments.verify_yookassa(settings_obj, external_id)
+            except Exception:  # noqa: BLE001 — refresh не должен падать из-за сети
+                log.exception("refresh: ЮKassa не подтвердила счёт %s", external_id)
+                verified = None
+        if verified:
+            try:
+                amount = int(float(invoice.get("amount_rub") or 0))
+            except (TypeError, ValueError):
+                amount = 0
+            try:
+                _activate_provider_payment(
+                    conn,
+                    settings_obj,
+                    invoice.get("user_id"),
+                    invoice.get("kind"),
+                    str(verified.get("charge_id") or external_id),
+                    amount,
+                    "RUB",
+                    "yookassa",
+                )
+                store.mark_invoice(conn, external_id, "succeeded")
+            except Exception:  # noqa: BLE001 — статус всё равно вернём
+                log.exception("refresh: не удалось активировать счёт %s", external_id)
+    profile = store.get_profile(conn, user["id"])
+    today = calc.local_today(settings_obj.timezone)
+    return json_ok(_subscription_json(profile, settings_obj, today))
+
+
 # --- сборка приложения ----------------------------------------------------------
 
 async def get_export(request: web.Request) -> web.Response:
     """GET /api/export?period=day|week|month&fmt=png|xlsx|docx — файл-отчёт с разбором ИИ."""
     user = _user(request)
+    settings_obj = _settings(request)
+    conn = _conn(request)
     period = (request.query.get("period") or "day").lower()
     fmt = (request.query.get("fmt") or "png").lower()
+    profile = store.get_profile(conn, user["id"])
+    today = calc.local_today(settings_obj.timezone)
+    use_llm = effective_ai(profile, today)
     try:
         filename, payload = await asyncio.to_thread(
-            reports.build, _conn(request), user["id"], period, fmt)
+            reports.build, conn, user["id"], period, fmt, use_llm=use_llm)
     except ValueError as exc:
         raise _bad(str(exc))
     content_type = {
@@ -1628,12 +2233,21 @@ async def get_export(request: web.Request) -> web.Response:
 
 def create_app(settings, conn) -> web.Application:
     """Собирает aiohttp-приложение: API, статика webapp и обработчики ошибок."""
-    app = web.Application(middlewares=[error_middleware], client_max_size=MAX_BODY_BYTES)
+    app = web.Application(
+        middlewares=[error_middleware, subscription_middleware],
+        client_max_size=MAX_BODY_BYTES,
+    )
     app[auth.SETTINGS_KEY] = settings
     app[auth.CONN_KEY] = conn
 
     app.router.add_get("/api/health", health)
     app.router.add_get("/api/bootstrap", get_bootstrap)
+    app.router.add_get("/api/subscription", get_subscription)
+    app.router.add_post("/api/pay/invoice", post_pay_invoice)
+    app.router.add_post("/api/pay/refresh", post_pay_refresh)
+    app.router.add_post("/api/pay/yookassa", post_pay_yookassa)
+    app.router.add_post("/api/pay/robokassa/result", post_pay_robokassa_result)
+    app.router.add_get("/api/pay/robokassa/success", get_pay_robokassa_success)
     app.router.add_get("/api/profile", get_profile)
     app.router.add_put("/api/profile", put_profile)
     app.router.add_get("/api/meals", get_meals)

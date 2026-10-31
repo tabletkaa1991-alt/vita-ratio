@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS profiles (
     goal_weight_kg REAL,
     goal_date      TEXT,
     ai_enabled     INTEGER NOT NULL DEFAULT 0,  -- ИИ-разбор заметок (потом можно закрыть оплатой)
+    sub_until      TEXT,                        -- подписка на бота (250 ₽/мес)
+    ai_until       TEXT,                        -- аддон ИИ (+100 ₽/мес), продлевается отдельно
     theme_accent   TEXT    NOT NULL DEFAULT '#B7F75C',
     theme_bg       TEXT    NOT NULL DEFAULT '#0E1116',
     theme_card     TEXT    NOT NULL DEFAULT '#151A21',
@@ -145,3 +147,30 @@ CREATE TABLE IF NOT EXISTS notes (
     created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_notes_user_date ON notes(user_id, date);
+
+-- Платежи Telegram Stars: base = 250 ₽/мес (доступ к боту), ai = +100 ₽/мес (ИИ-разбор)
+CREATE TABLE IF NOT EXISTS payments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind       TEXT    NOT NULL CHECK (kind IN ('base', 'ai')),
+    charge_id  TEXT    NOT NULL UNIQUE,
+    amount     INTEGER NOT NULL,
+    currency   TEXT    NOT NULL DEFAULT 'XTR',
+    payload    TEXT    NOT NULL DEFAULT '',
+    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Рублёвые счета эквайринга (ЮKassa/Robokassa): оплата картой, деньги сразу на карту самозанятого
+CREATE TABLE IF NOT EXISTS invoices (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind        TEXT    NOT NULL CHECK (kind IN ('base', 'ai')),
+    provider    TEXT    NOT NULL DEFAULT 'yookassa',
+    external_id TEXT    NOT NULL UNIQUE,  -- id платежа у провайдера (YooKassa payment id / Robokassa InvId)
+    amount_rub  REAL    NOT NULL,
+    status      TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'succeeded', 'canceled')),
+    payload     TEXT    NOT NULL DEFAULT '',
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_invoices_user ON invoices(user_id);
+
