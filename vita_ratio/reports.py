@@ -6,10 +6,17 @@
 from __future__ import annotations
 
 import io
+import json
+import logging
+import os
 import sqlite3
+import urllib.parse
+import urllib.request
 from datetime import timedelta
 
 from . import calc
+
+log = logging.getLogger("vita_ratio.reports")
 
 ACCENT = "#B7F75C"
 PERIODS = {"day": "День", "week": "Неделя", "month": "Месяц"}
@@ -116,8 +123,8 @@ def collect(conn: sqlite3.Connection, user_id: int, period: str = "day", today: 
     return data
 
 
-def ai_comment(data: dict) -> str:
-    """Локальный «ИИ-коуч»: короткий разбор цифр + конкретный совет (без внешнего API)."""
+def _local_comment(data: dict) -> str:
+    """Локальный коуч (фолбэк): короткий разбор цифр + конкретный совет без внешнего API."""
     t = data["totals"]
     targets = data.get("targets") or {}
     profile = data.get("profile") or {}
@@ -171,6 +178,79 @@ def ai_comment(data: dict) -> str:
     elif note_text:
         tips.append("Заметка учтена: держи фокус на том, что сработало в этом периоде.")
     return " ".join(tips[:5])
+
+
+# --- настоящая LLM (бесплатный text-API, без ключа) ---------------------------
+
+LLM_URL = "https://text.pollinations.ai/openai"
+LLM_MODEL = os.environ.get("AI_MODEL", "openai")
+
+
+def _prompt(data: dict) -> str:
+    t = data["totals"]
+    targets = data.get("targets") or {}
+    profile = data.get("profile") or {}
+    note = (data["notes"][-1]["text"] if data["notes"] else "") or ""
+    lines = [
+        f"Период: {data['label']}.",
+        f"Калории: в среднем {t['avg_kcal']} ккал/день"
+        + (f", цель {targets['kcal']} ккал." if targets.get("kcal") else "."),
+        f"Белок/жиры/углеводы за период: {t['protein']}/{t['fat']}/{t['carbs']} г.",
+        f"Сон в среднем: {t['avg_sleep_h']} ч." if t["avg_sleep_h"] else "Сон: нет данных.",
+        f"План дня: выполнено {data['plans']['done']} из {data['plans']['total']}."
+        if data["plans"]["total"] else "План дня: нет записей.",
+    ]
+    if data["weight"]["start"] is not None:
+        lines.append(f"Вес: {data['weight']['start']} → {data['weight']['end']} кг, "
+                     f"цель {profile.get('goal_weight_kg') or '—'} кг.")
+    if note:
+        lines.append(f"Последняя заметка пользователя: «{note[:300]}».")
+    return "\n".join(lines)
+
+
+def _llm_comment(prompt: str) -> str | None:
+    """Запрос к бесплатной LLM (GET, затем POST). None при сбое — вызывающий уйдёт в фолбэк."""
+    system = ("Ты нутрициолог-коуч приложения Vita Ratio. Отвечай по-русски, 2-4 предложения, "
+              "конкретно и дружелюбно. Без списков и markdown.")
+    quoted = urllib.parse.quote(f"{system}\n\nДанные пользователя:\n{prompt}", safe="")
+    try:
+        with urllib.request.urlopen(
+            f"https://text.pollinations.ai/{quoted}?model={LLM_MODEL}&private=true", timeout=15
+        ) as response:
+            text = response.read().decode("utf-8", "ignore").strip()
+        if text and not text.startswith("{"):
+            return text[:1500]
+    except Exception as exc:
+        log.warning("ai: GET не сработал (%s: %s)", type(exc).__name__, str(exc)[:100])
+    body = json.dumps({
+        "model": LLM_MODEL,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+        "temperature": 0.6,
+        "max_tokens": 220,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        LLM_URL, data=body, method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": "vita-ratio/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read())
+        return (payload["choices"][0]["message"].get("content") or "").strip()[:1500] or None
+    except Exception as exc:  # лимиты/сеть/формат — уходим в локальный разбор
+        log.warning("ai: fallback на локальный коуч (%s: %s)", type(exc).__name__, str(exc)[:120])
+        return None
+
+
+def ai_comment(data: dict, use_llm: bool | None = None) -> str:
+    """Ответ ИИ: реальная модель (бесплатный API) либо локальный коуч при недоступности."""
+    if use_llm is None:
+        use_llm = os.environ.get("AI_COMMENT", "auto").lower() != "off"
+    if use_llm and data["totals"]["days_with_food"]:
+        text = _llm_comment(_prompt(data))
+        if text:
+            log.info("ai: ответ модели получен (%s)", LLM_MODEL)
+            return text
+    return _local_comment(data)
 
 
 # --- заметки ------------------------------------------------------------------

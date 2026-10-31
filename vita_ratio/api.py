@@ -17,7 +17,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from . import __version__, auth, calc, foods, notify, store
+from . import __version__, auth, calc, foods, notify, reports, store
 
 log = logging.getLogger("vita_ratio.api")
 
@@ -1528,6 +1528,28 @@ async def static_file(request: web.Request) -> web.Response:
 
 # --- сборка приложения ----------------------------------------------------------
 
+async def get_export(request: web.Request) -> web.Response:
+    """GET /api/export?period=day|week|month&fmt=png|xlsx|docx — файл-отчёт с разбором ИИ."""
+    user = _user(request)
+    period = (request.query.get("period") or "day").lower()
+    fmt = (request.query.get("fmt") or "png").lower()
+    try:
+        filename, payload = await asyncio.to_thread(
+            reports.build, _conn(request), user["id"], period, fmt)
+    except ValueError as exc:
+        raise _bad(str(exc))
+    content_type = {
+        "png": "image/png",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }[fmt]
+    return web.Response(body=payload, headers={
+        "Content-Type": content_type,
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+    })
+
+
 def create_app(settings, conn) -> web.Application:
     """Собирает aiohttp-приложение: API, статика webapp и обработчики ошибок."""
     app = web.Application(middlewares=[error_middleware], client_max_size=MAX_BODY_BYTES)
@@ -1559,6 +1581,7 @@ def create_app(settings, conn) -> web.Application:
     app.router.add_get("/api/theme", get_theme)
     app.router.add_put("/api/theme", put_theme)
     app.router.add_get("/api/day", get_day)
+    app.router.add_get("/api/export", get_export)
     app.router.add_post("/api/day", post_day)
     app.router.add_put("/api/day/{item_id}", put_day)
     app.router.add_delete("/api/day/{item_id}", delete_day)
