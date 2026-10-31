@@ -767,7 +767,14 @@ def _profile_payload(payload: dict, settings, existing: dict | None) -> dict:
 
 async def health(request: web.Request) -> web.Response:
     settings = _settings(request)
-    return json_ok({"status": "ok", "version": __version__, "env": settings.app_env})
+    provider = (os.environ.get("AI_PROVIDER") or "").strip().lower() or "pollinations"
+    model = (os.environ.get("AI_MODEL") or "").strip() or None
+    return json_ok({
+        "status": "ok",
+        "version": __version__,
+        "env": settings.app_env,
+        "ai": {"provider": provider, "model": model, "key_set": bool(os.environ.get("AI_API_KEY"))},
+    })
 
 
 async def get_profile(request: web.Request) -> web.Response:
