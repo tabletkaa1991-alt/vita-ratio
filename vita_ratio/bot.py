@@ -53,6 +53,7 @@ MORNING_WINDOW_MIN = 60          # утренняя сводка: в течен�
 
 KIND_MORNING = "morning"
 KIND_SLEEP = "sleep"
+KIND_TRIAL_END = "trial_end"     # D-1: напоминание за день до конца бесплатного периода
 MEAL_KIND_PREFIX = "meal_"
 
 MONTHS_GEN = [
@@ -71,6 +72,7 @@ NO_PROFILE_TEXT = (
 HELP_TITLE = "🤖 <b>Vita Ratio — что я умею</b>"
 HELP_BODY = """<b>Команды</b>
 /start — приветствие и кнопка приложения
+/menu — меню: срок доступа, таймер периода и команды
 /app — открыть мини-приложение
 /today — сводка за сегодня: калории, белок, сон, ближайшее занятие
 /plan — план приёмов пищи на сегодня
@@ -99,13 +101,25 @@ PAYWALL_TEXT = (
 )
 #: Команды, которые работают всегда (вне платного гейта).
 FREE_COMMANDS = frozenset({
-    "/start", "/app", "/help", "/subscription", "/whoami",
+    "/start", "/menu", "/app", "/help", "/subscription", "/whoami",
     "/grant", "/revoke", "/free_list",
 })
 #: Команды, которым нужна активная base-подписка.
 GATED_COMMANDS = frozenset({
     "/today", "/plan", "/classes", "/sleep", "/targets", "/note", "/notes", "/export",
 })
+#: Краткий список команд для /menu (полная справка — /help).
+MENU_COMMANDS = (
+    "/today — сводка за сегодня",
+    "/plan — план питания",
+    "/classes — ближайшие занятия",
+    "/sleep — сон и окно питания",
+    "/targets — цели по КБЖУ и воде",
+    "/export — отчёт (PNG, DOCX, XLSX)",
+    "/subscription — подписка и оплата",
+    "/whoami — мой Telegram ID",
+    "/help — полная справка",
+)
 
 
 def _date_active(value: Any, today: str) -> bool:
@@ -151,6 +165,137 @@ def _is_free_message(
         getattr(from_user, "username", None),
         conn,
     )
+
+
+# --- таймер бесплатного периода (v5) -------------------------------------------
+
+def _day(value: Any) -> date_cls | None:
+    """ISO-дата/date -> date; мусор -> None."""
+    if isinstance(value, date_cls):
+        return value
+    if not value:
+        return None
+    try:
+        return date_cls.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _dotted(value: Any, with_year: bool = False) -> str:
+    """Дата для текста: ``2026-11-07`` -> ``07.11`` или ``07.11.2026``."""
+    parsed = _day(value)
+    if parsed is None:
+        return ""
+    if with_year:
+        return f"{parsed.day:02d}.{parsed.month:02d}.{parsed.year}"
+    return f"{parsed.day:02d}.{parsed.month:02d}"
+
+
+def _username_for(conn: sqlite3.Connection | None, user_id: Any) -> str | None:
+    """Username из ``users`` — чтобы бесплатный доступ по нику тоже учитывался."""
+    if conn is None or user_id is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT username FROM users WHERE id = ?", (int(user_id),)
+        ).fetchone()
+    except (sqlite3.Error, AttributeError, TypeError, ValueError):
+        return None
+    return str(row["username"]) if row is not None and row["username"] else None
+
+
+def format_trial_timer(
+    profile: Any,
+    settings_obj: Settings,
+    today: str | None = None,
+    conn: sqlite3.Connection | None = None,
+    username: str | None = None,
+) -> str | None:
+    """Живая строка таймера бесплатного периода; ``None`` — показывать нечего.
+
+    * бесплатный доступ (``access.is_free`` по env/БД) -> ``None``: /menu
+      покажет отдельный текст «бесплатно», таймер не нужен;
+    * ``sub_until`` в будущем: 0 дней — «последний день», 1 день — «продлить»,
+      2+ — «осталось N дн. (до DD.MM)»;
+    * даты нет или она истекла -> ``None``.
+
+    ``today`` — для детерминированных тестов; ``conn``/``username`` — чтобы
+    учесть бесплатный доступ, выданный через /grant (таблица ``free_access``).
+    """
+    if not profile:
+        return None
+    user_id = _dget(profile, "user_id", None)
+    if user_id is not None:
+        if username is None:
+            username = _username_for(conn, user_id)
+        if access.is_free(settings_obj, user_id=user_id, username=username, conn=conn):
+            return None
+    until = _day(_dget(profile, "sub_until", None))
+    if until is None:
+        return None
+    current = _day(today)
+    if current is None:
+        current = _day(
+            calc.local_today(getattr(settings_obj, "timezone", None) or DEFAULT_TIMEZONE)
+        )
+    if current is None:
+        return None
+    delta = (until - current).days
+    if delta < 0:
+        return None
+    short = _dotted(until)
+    if delta == 0:
+        return f"⏳ Бесплатный период: последний день (до {short})"
+    if delta == 1:
+        return "⏳ Бесплатный период: остался 1 день — продлить: /subscription"
+    return f"⏳ Бесплатный период: осталось {delta} дн. (до {short})"
+
+
+def trial_end_text(until: Any, settings_obj: Settings | None = None) -> str:
+    """Текст напоминания D-1: бесплатный период заканчивается завтра."""
+    try:
+        base_price = int(getattr(settings_obj, "base_price_rub", 250) or 250)
+    except (TypeError, ValueError):
+        base_price = 250
+    try:
+        ai_price = int(getattr(settings_obj, "ai_price_rub", 100) or 100)
+    except (TypeError, ValueError):
+        ai_price = 100
+    return (
+        f"⏳ Бесплатный период Vita Ratio заканчивается завтра "
+        f"(до {_dotted(until, with_year=True)}).\n"
+        f"Остался 1 день. Продлить: /subscription — {base_price} ₽/мес, ИИ +{ai_price} ₽/мес."
+    )
+
+
+def trial_end_due(
+    settings_obj: Settings,
+    conn: sqlite3.Connection,
+    profile: Any,
+    today: str,
+    free: bool = False,
+) -> str | None:
+    """Текст D-1-напоминания или ``None`` (free / не завтра / уже отправлено)."""
+    if not profile or free:
+        return None
+    try:
+        user_id = int(_dget(profile, "user_id", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if user_id <= 0:
+        return None
+    until = _day(_dget(profile, "sub_until", None))
+    current = _day(today)
+    if until is None or current is None:
+        return None
+    if (until - current).days != 1:
+        return None
+    try:
+        if store.reminder_exists(conn, user_id, current.isoformat(), KIND_TRIAL_END):
+            return None
+    except sqlite3.Error:
+        return None
+    return trial_end_text(until, settings_obj)
 
 
 # --- бесплатный доступ: команды владельца (/whoami, /grant, /revoke, /free_list) ---
@@ -287,9 +432,16 @@ def command_free_list(settings_obj: Settings, conn: sqlite3.Connection, message:
 
 
 def format_subscription(
-    profile: Any, settings_obj: Settings, today: str, free: bool = False
+    profile: Any,
+    settings_obj: Settings,
+    today: str,
+    free: bool = False,
+    timer: str | None = None,
 ) -> str:
-    """Текст /subscription: статус base/ai, даты и цены (или «бесплатно»)."""
+    """Текст /subscription: статус base/ai, даты и цены (или «бесплатно»).
+
+    ``timer`` — строка :func:`format_trial_timer` (живой таймер триала), если есть.
+    """
     if free:
         return "\n".join([
             "🎁 Бесплатный доступ включён (бессрочно)",
@@ -333,6 +485,42 @@ def format_subscription(
     if not base_on:
         lines.append("")
         lines.append("ИИ-аддон доступен после оформления подписки.")
+    if timer:
+        lines.extend(["", timer])
+    return "\n".join(lines)
+
+
+def format_menu(
+    profile: Any,
+    settings_obj: Settings,
+    today: str,
+    timer: str | None = None,
+    free: bool = False,
+) -> str:
+    """Текст /menu: срок доступа, живой таймер периода и краткий список команд.
+
+    ``timer`` — результат :func:`format_trial_timer` (пересчитывается на каждый
+    вызов /menu, поэтому счётчик в сообщении всегда актуальный).
+    """
+    lines = ["☰ <b>Меню Vita Ratio</b>", ""]
+    if free:
+        lines.append("🎁 Бесплатный доступ: бессрочно (подписка не нужна)")
+    else:
+        until = _dget(profile, "sub_until", None) if profile else None
+        if _date_active(until, today):
+            lines.append(
+                f"💳 Подписка: активна до <b>{_dotted(until, with_year=True)}</b>"
+            )
+        else:
+            lines.append("❌ Подписка не активна — оформить: /subscription")
+    if timer:
+        lines.append(timer)
+    lines.extend(["", "<b>Команды</b>", *MENU_COMMANDS])
+    if not profile:
+        lines.extend([
+            "",
+            "🌱 Профиль ещё не заполнен — пройди онбординг в приложении: /app",
+        ])
     return "\n".join(lines)
 
 
@@ -626,8 +814,15 @@ def _sleep_line(sleep_row: Any) -> str:
     return line
 
 
-def format_today(profile_row: Any, targets: Any, totals: Any, sleep_row: Any, next_class: Any) -> str:
-    """Сводка /today: калории/БЖУ vs цель, сон, ближайшее занятие."""
+def format_today(
+    profile_row: Any,
+    targets: Any,
+    totals: Any,
+    sleep_row: Any,
+    next_class: Any,
+    timer: str | None = None,
+) -> str:
+    """Сводка /today: калории/БЖУ vs цель, сон, ближайшее занятие (+ таймер)."""
     if profile_row is None:
         return NO_PROFILE_TEXT
 
@@ -668,6 +863,8 @@ def format_today(profile_row: Any, targets: Any, totals: Any, sleep_row: Any, ne
             except (TypeError, ValueError):
                 suffix = ""
         lines.append(f"📅 Ближайшее: <b>{title}</b> — {where} ({kind}){suffix}")
+    if timer:
+        lines.extend(["", timer])
     return "\n".join(lines)
 
 
@@ -971,17 +1168,52 @@ def mark_reminder_sent(conn: sqlite3.Connection, user_id: int, day: str, kind: s
 
 # --- сборка текстов команд -----------------------------------------------------
 
-def build_today(conn: sqlite3.Connection, user_id: int, default_tz: str = DEFAULT_TIMEZONE) -> str:
+def build_today(
+    conn: sqlite3.Connection,
+    user_id: int,
+    default_tz: str = DEFAULT_TIMEZONE,
+    settings_obj: Settings | None = None,
+    today: str | None = None,
+    username: str | None = None,
+) -> str:
+    """Текст /today; с ``settings_obj`` добавляет живой таймер периода."""
     profile = get_profile(conn, user_id)
     if profile is None:
         return format_today(None, None, None, None, None)
     now = calc.local_now(_profile_tz(profile, default_tz))
-    day = now.date().isoformat()
+    day = today or now.date().isoformat()
     targets = targets_for_profile(profile)
     totals = meal_totals(conn, user_id, day)
     sleep_row = sleep_for_date(conn, user_id, day)
     next_class = next_class_for(conn, user_id, now)
-    return format_today(profile, targets, totals, sleep_row, next_class)
+    timer = None
+    if settings_obj is not None:
+        timer = format_trial_timer(
+            profile, settings_obj, day, conn=conn, username=username
+        )
+    return format_today(profile, targets, totals, sleep_row, next_class, timer)
+
+
+def build_menu(
+    conn: sqlite3.Connection,
+    user_id: int,
+    settings_obj: Settings,
+    default_tz: str = DEFAULT_TIMEZONE,
+    today: str | None = None,
+    username: str | None = None,
+) -> str:
+    """Текст /menu: статус доступа + таймер, пересчитанный на этот вызов."""
+    profile = get_profile(conn, user_id)
+    day = today or calc.local_today(_profile_tz(profile, default_tz))
+    if username is None:
+        username = _username_for(conn, user_id)
+    free = access.is_free(settings_obj, user_id=user_id, username=username, conn=conn)
+    timer = None
+    if not free:
+        timer = format_trial_timer(
+            profile, settings_obj, day, conn=conn, username=username
+        )
+    return format_menu(profile, settings_obj, day, timer=timer, free=free)
 
 
 def build_plan(conn: sqlite3.Connection, user_id: int, default_tz: str = DEFAULT_TIMEZONE) -> str:
@@ -1110,7 +1342,17 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
             log.exception("Не удалось прочитать профиль для /subscription (user_id=%s)", user_id)
             profile = None
         today = calc.local_today(default_tz)
-        text = format_subscription(profile, settings_obj, today, free)
+        timer = None
+        if not free:
+            sender = _sender(message)
+            timer = format_trial_timer(
+                profile,
+                settings_obj,
+                today,
+                conn=conn,
+                username=getattr(sender, "username", None) if sender else None,
+            )
+        text = format_subscription(profile, settings_obj, today, free, timer=timer)
         if free:
             # Бесплатный доступ: без цен и без кнопок оплаты.
             await answer(message, text, open_app_keyboard(settings_obj.app_url))
@@ -1145,6 +1387,23 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
     @router.message(Command("subscription"))
     async def cmd_subscription(message: Message) -> None:
         await send_subscription(message)
+
+    @router.message(Command("menu"))
+    async def cmd_menu(message: Message) -> None:
+        """Меню: срок доступа, живой таймер периода и краткий список команд."""
+        sender = _sender(message)
+        try:
+            text = build_menu(
+                conn,
+                user_id_of(message),
+                settings_obj,
+                default_tz,
+                username=getattr(sender, "username", None) if sender else None,
+            )
+        except sqlite3.Error:
+            log.exception("Ошибка /menu для user_id=%s", user_id_of(message))
+            text = "😔 Не получилось показать меню. Попробуй ещё раз чуть позже."
+        await answer(message, text, open_app_keyboard(settings_obj.app_url))
 
     @router.message(Command("whoami"))
     async def cmd_whoami(message: Message) -> None:
@@ -1210,8 +1469,15 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
     async def cmd_today(message: Message) -> None:
         if not await require_base(message):
             return
+        sender = _sender(message)
         try:
-            text = build_today(conn, user_id_of(message), default_tz)
+            text = build_today(
+                conn,
+                user_id_of(message),
+                default_tz,
+                settings_obj=settings_obj,
+                username=getattr(sender, "username", None) if sender else None,
+            )
         except sqlite3.Error:
             log.exception("Ошибка /today для user_id=%s", user_id_of(message))
             text = "😔 Не получилось получить данные. Попробуй ещё раз чуть позже."
@@ -1343,13 +1609,88 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
 
 # --- фоновые напоминания -------------------------------------------------------
 
+async def _trial_end_tick(
+    conn: sqlite3.Connection,
+    bot: Bot,
+    settings_obj: Settings,
+    blocked: set[int],
+) -> None:
+    """D-1: за день до конца бесплатного периода — одно сообщение с кнопкой.
+
+    Обходит профили с заполненным ``sub_until`` (независимо от тумблера
+    обычных напоминаний: это сообщение про оплату, а не про режим дня).
+    Дедуп — ``reminder_log(user_id, date, kind='trial_end')``; бесплатный
+    доступ (whitelist) пропускается. Ошибки ловятся, цикл не роняем.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT * FROM profiles WHERE sub_until IS NOT NULL ORDER BY user_id"
+        ).fetchall()
+    except sqlite3.Error:
+        log.exception("Не удалось прочитать профили для D-1 напоминания")
+        return
+    for row in rows:
+        profile = dict(row)
+        user_id = int(profile.get("user_id") or 0)
+        if not user_id or user_id in blocked:
+            continue
+        now = calc.local_now(_profile_tz(profile, settings_obj.timezone))
+        today = now.date().isoformat()
+        try:
+            free = access.is_free(
+                settings_obj,
+                user_id=user_id,
+                username=_username_for(conn, user_id),
+                conn=conn,
+            )
+        except Exception:  # noqa: BLE001 — гейт free не должен ронять тик
+            log.exception("Не удалось проверить бесплатный доступ для %s", user_id)
+            continue
+        text = trial_end_due(settings_obj, conn, profile, today, free)
+        if text is None:
+            continue
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=open_app_keyboard(settings_obj.app_url),
+            )
+        except TelegramForbiddenError:
+            blocked.add(user_id)
+            log.warning(
+                "Пользователь %s заблокировал бота — D-1 напоминания приостановлены",
+                user_id,
+            )
+            continue
+        except TelegramRetryAfter as exc:
+            log.warning(
+                "Telegram просит подождать %s с — D-1 напоминание для %s отложено",
+                getattr(exc, "retry_after", "?"),
+                user_id,
+            )
+            continue
+        except TelegramAPIError as exc:
+            log.warning("Не удалось отправить D-1 напоминание %s: %s", user_id, exc)
+            continue
+        except Exception:  # noqa: BLE001 — напоминания не должны ронять бота
+            log.exception("Неожиданная ошибка D-1 напоминания для %s", user_id)
+            continue
+        try:
+            store.mark_reminder(conn, user_id, today, KIND_TRIAL_END)
+        except sqlite3.Error:
+            log.exception("Не удалось записать reminder_log D-1 для %s", user_id)
+
+
 async def _reminder_tick(
     conn: sqlite3.Connection,
     bot: Bot,
     settings_obj: Settings,
     blocked: set[int],
 ) -> None:
-    """Один проход по профилям с включёнными напоминаниями."""
+    """Один проход: D-1 про конец периода + напоминания по режиму дня."""
+    await _trial_end_tick(conn, bot, settings_obj, blocked)
     rows = conn.execute("SELECT * FROM profiles WHERE reminders = 1 ORDER BY user_id").fetchall()
     for row in rows:
         profile = dict(row)
@@ -1417,6 +1758,7 @@ async def _set_commands(bot: Bot) -> None:
     try:
         await bot.set_my_commands([
             BotCommand(command="start", description="Приветствие и кнопка приложения"),
+            BotCommand(command="menu", description="Меню: доступ, таймер периода, команды"),
             BotCommand(command="app", description="Открыть мини-приложение"),
             BotCommand(command="today", description="Сводка за сегодня"),
             BotCommand(command="plan", description="План питания на сегодня"),

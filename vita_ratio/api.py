@@ -1080,9 +1080,21 @@ async def put_profile(request: web.Request) -> web.Response:
     free = is_free_user(settings, user, conn)
     if existing is None:
         # Первый профиль = онбординг завершён: поздравительное сообщение в чат.
+        # Дата триала (sub_until) уже записана ensure_trial — показываем её и
+        # таймер в приветствии, чтобы пользователь сразу видел свой срок.
+        subscription = store.get_subscription(conn, user["id"])
         try:
             task = asyncio.create_task(
-                notify.notify_registration(settings, user["id"], user.get("first_name"), targets)
+                notify.notify_registration(
+                    settings,
+                    user["id"],
+                    user.get("first_name"),
+                    targets,
+                    trial_until=subscription.get("sub_until"),
+                    trial_days=settings.trial_days,
+                    base_price_rub=settings.base_price_rub,
+                    today=today,
+                )
             )
             task.add_done_callback(_log_notify_result)
         except RuntimeError:  # нет running loop (например, в тестах)

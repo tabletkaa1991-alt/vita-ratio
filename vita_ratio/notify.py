@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+from datetime import date as date_cls
 
 import aiohttp
 
@@ -17,9 +18,85 @@ log = logging.getLogger("vita_ratio.notify")
 
 WELCOME_CHECK = "✅"
 
+#: Сколько дней по умолчанию в бесплатном периоде (совпадает с TRIAL_DAYS).
+DEFAULT_TRIAL_DAYS = 7
+#: Базовая цена подписки по умолчанию (₽/мес) — как BASE_PRICE_RUB.
+DEFAULT_BASE_PRICE_RUB = 250
 
-def registration_text(first_name: str | None = None, targets: dict | None = None) -> str:
-    """Текст поздравления после успешной регистрации (онбординга)."""
+
+def _parse_day(value) -> date_cls | None:
+    """ISO-дата/date из значения; мусор -> None (блок не показываем)."""
+    if isinstance(value, date_cls):
+        return value
+    if not value:
+        return None
+    try:
+        return date_cls.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _days_word(value: int) -> str:
+    """Русская форма слова «день» для числа."""
+    number = abs(int(value))
+    if number % 10 == 1 and number % 100 != 11:
+        return "день"
+    if 2 <= number % 10 <= 4 and not 12 <= number % 100 <= 14:
+        return "дня"
+    return "дней"
+
+
+def _trial_lines(
+    trial_until=None,
+    trial_days: int | None = None,
+    base_price_rub: int = DEFAULT_BASE_PRICE_RUB,
+    today=None,
+) -> list[str]:
+    """Строки блока «бесплатный период»; [] — если даты нет/она уже прошла.
+
+    Даты и числа экранировать не нужно (только цифры и точки), но цена берётся
+    из настроек и приводится к целому, чтобы HTML не сломать.
+    """
+    until = _parse_day(trial_until)
+    if until is None:
+        return []
+    current = _parse_day(today) or date_cls.today()
+    try:
+        total = int(trial_days) if trial_days is not None else (until - current).days
+    except (TypeError, ValueError):
+        total = (until - current).days
+    left = (until - current).days
+    if total <= 0 or left < 0:
+        return []
+    try:
+        price = int(base_price_rub)
+    except (TypeError, ValueError):
+        price = DEFAULT_BASE_PRICE_RUB
+    date_text = f"{until.day:02d}.{until.month:02d}.{until.year}"
+    return [
+        f"🎁 Бесплатный период активирован: {total} {_days_word(total)}, до {date_text}.",
+        (
+            f"⏳ Осталось: {left} дн. Таймер обновляется в /menu. "
+            f"Следующая оплата не требуется — подписка {price} ₽/мес начнётся после периода."
+        ),
+    ]
+
+
+def registration_text(
+    first_name: str | None = None,
+    targets: dict | None = None,
+    trial_until=None,
+    trial_days: int | None = None,
+    base_price_rub: int = DEFAULT_BASE_PRICE_RUB,
+    today=None,
+) -> str:
+    """Текст поздравления после успешной регистрации (онбординга).
+
+    ``trial_until``/``trial_days`` добавляют блок про бесплатный период. Без
+    ``trial_until`` текст прежний: старые вызовы ``registration_text(name,
+    targets)`` работают как раньше. ``today`` — для детерминированного расчёта
+    «осталось N дн.» в тестах (по умолчанию — сегодняшняя дата сервера).
+    """
     name = html.escape(str(first_name).strip()) if first_name else ""
     greeting = f"{name}, " if name else ""
     lines = [
@@ -40,6 +117,9 @@ def registration_text(first_name: str | None = None, targets: dict | None = None
                 carbs=int(targets.get("carbs") or 0),
             )
         )
+    trial_lines = _trial_lines(trial_until, trial_days, base_price_rub, today)
+    if trial_lines:
+        lines.extend(["", *trial_lines])
     lines.extend([
         "",
         "Открывай приложение, записывай еду, сон и тренировки — я напомню о приёмах пищи и отбое.",
@@ -94,6 +174,26 @@ async def notify_registration(
     user_id: int,
     first_name: str | None = None,
     targets: dict | None = None,
+    *,
+    trial_until=None,
+    trial_days: int | None = None,
+    base_price_rub: int = DEFAULT_BASE_PRICE_RUB,
+    today=None,
 ) -> bool:
-    """Поздравление после создания профиля (онбординг завершён)."""
-    return await send_message(settings, user_id, registration_text(first_name, targets))
+    """Поздравление после создания профиля (онбординг завершён).
+
+    Дополнительные kwargs (``trial_until``, ``trial_days``, ``base_price_rub``,
+    ``today``) прокидываются в :func:`registration_text` и добавляют блок про
+    активированный бесплатный период. Все они необязательные: старые вызовы
+    ``notify_registration(settings, user_id, first_name, targets)`` работают
+    как раньше.
+    """
+    text = registration_text(
+        first_name,
+        targets,
+        trial_until=trial_until,
+        trial_days=trial_days,
+        base_price_rub=base_price_rub,
+        today=today,
+    )
+    return await send_message(settings, user_id, text)
