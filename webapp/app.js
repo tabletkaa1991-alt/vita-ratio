@@ -206,6 +206,15 @@
     return isoDate(new Date());
   }
 
+  /* Дата действует по сегодня включительно (как backend: ai_until >= today).
+     «Сегодня» берём из bootstrap (серверный день), иначе — локальное. */
+  function dateActive(value) {
+    var iso = String(value == null ? '' : value).slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) { return false; }
+    var today = String((state && state.todayDate) || todayIso()).slice(0, 10);
+    return iso >= today;
+  }
+
   function parseIso(value) {
     var match = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(value == null ? '' : value));
     if (!match) { return new Date(); }
@@ -897,8 +906,10 @@
   function subscriptionPaywallVisible() {
     if (state.pay.forcePaywall) { return true; }
     var sub = subscriptionPayload();
-    /* Блокируем доступ только когда подписка не активна и режим включён. */
-    return !!(sub && sub.active !== true && sub.enforced === true);
+    /* Пока профиля нет — сначала онбординг: он и выдаст бесплатный период.
+       Блокируем доступ только когда профиль есть, подписка не активна и режим включён. */
+    var hasProfile = !!(state.bootstrap && state.bootstrap.profile);
+    return !!(hasProfile && sub && sub.active !== true && sub.enforced === true);
   }
 
   function syncPaywallLock() {
@@ -982,12 +993,12 @@
       state.subscription.missing = false;
       var normalized = normalizeSubscription(data);
       state.subscription.data = normalized;
-      /* Эффективный ИИ (флаг И аддон) — источник правды и для экрана ИИ,
-         и для тумблера в настройках. Оплаченный, но выключенный аддон
-         не должен оставлять поле ввода на экране «ИИ». */
+      /* Эффективный ИИ (ai_active = флаг И аддон/free) — источник правды
+         и для экрана ИИ, и для тумблера в настройках. Оплаченный, но
+         выключенный аддон не должен оставлять поле ввода на экране «ИИ». */
       if (normalized) {
-        state.aiChat.active = normalized.ai_enabled === true;
-        if (normalized.ai_enabled === true) {
+        state.aiChat.active = normalized.ai_active === true;
+        if (normalized.ai_active === true) {
           state.aiChat.forcePaywall = false;
         }
       }
@@ -1244,7 +1255,9 @@
   /* ======================= экран «Настройки» (CONTRACT §36–37) ======================= */
 
   /* Единый рендер тумблера ИИ-аддона. Источник данных — /api/subscription:
-     ai_active — оплаченный/промо-период, ai_enabled — эффективный флаг ИИ. */
+     ai_active — эффективный доступ (флаг И срок/free), ai_enabled — сырой флаг,
+     ai_until — оплаченная дата. Наличие аддона определяем по free/ai_until,
+     чтобы отличить «оплачен, но выключен» от «аддона нет». */
   function renderAiPlan(sub) {
     var data = sub || subscriptionPayload();
     var toggle = byId('ai-plan-toggle');
@@ -1254,8 +1267,8 @@
     var payButton = byId('ai-plan-pay-btn');
     var rub = data ? data.ai_price_rub : SUBSCRIPTION_DEFAULTS.ai_price_rub;
     var stars = data ? data.ai_price_stars : SUBSCRIPTION_DEFAULTS.ai_price_stars;
-    var addonActive = !!(data && data.ai_active === true);
-    var enabled = addonActive && data.ai_enabled === true;
+    var enabled = !!(data && data.ai_active === true);
+    var addonActive = !!(data && (data.free === true || dateActive(data.ai_until)));
 
     if (priceNode) { priceNode.textContent = fmtInt(rub); }
     if (starsNode) { starsNode.textContent = fmtInt(stars); }
@@ -1318,8 +1331,8 @@
   function onAiPlanToggle() {
     if (state.pay.aiToggleBusy) { return; }
     var sub = subscriptionPayload();
-    var addonActive = !!(sub && sub.ai_active === true);
-    var enabled = addonActive && sub.ai_enabled === true;
+    /* ai_active — эффективный доступ: именно он определяет положение тумблера. */
+    var enabled = !!(sub && sub.ai_active === true);
     state.pay.aiToggleBusy = true;
     renderAiPlan(sub);
     haptic('select');
@@ -1329,7 +1342,10 @@
       if (enabled) {
         /* Выключение: оплаченный период сохраняется, ИИ просто не работает. */
         var offSub = subscriptionPayload();
-        if (offSub) { offSub.ai_enabled = false; }
+        if (offSub) {
+          offSub.ai_enabled = false;
+          offSub.ai_active = false;
+        }
         renderAiPlan(offSub);
         haptic('success');
         toast('ИИ выключен');

@@ -1937,6 +1937,20 @@ async def run_bot(settings_obj: Settings, conn: sqlite3.Connection | None = None
     dispatcher = Dispatcher()
     dispatcher.include_router(build_router(settings_obj, own_conn))
 
+    # Старые профили без даты подписки получают бесплатный период при старте бота.
+    try:
+        pending = own_conn.execute(
+            "SELECT user_id FROM profiles WHERE sub_until IS NULL"
+        ).fetchall()
+        for row in pending:
+            store.grant_trial_if_missing(
+                own_conn, int(row["user_id"]), settings_obj.trial_days, settings_obj.ai_trial_days
+            )
+        if pending:
+            log.info("Выдан бесплатный период %s профилям без даты подписки", len(pending))
+    except sqlite3.Error:
+        log.exception("Не удалось выдать пропущенные бесплатные периоды")
+
     reminder_task = asyncio.create_task(
         _reminder_loop(settings_obj, bot), name="vita-ratio-reminders"
     )

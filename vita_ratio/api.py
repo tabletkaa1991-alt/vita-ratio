@@ -1059,9 +1059,15 @@ async def health(request: web.Request) -> web.Response:
 async def get_profile(request: web.Request) -> web.Response:
     user = _user(request)
     settings = _settings(request)
-    profile = store.get_profile(_conn(request), user["id"])
+    conn = _conn(request)
+    profile = store.get_profile(conn, user["id"])
     today = calc.local_today(settings.timezone)
-    free = is_free_user(settings, user, _conn(request))
+    if profile:
+        store.grant_trial_if_missing(
+            conn, user["id"], settings.trial_days, settings.ai_trial_days, today=today
+        )
+        profile = store.get_profile(conn, user["id"])
+    free = is_free_user(settings, user, conn)
     return json_ok({
         "profile": _profile_json(profile, today, free),
         "targets": _targets_json(profile),
@@ -1901,6 +1907,12 @@ async def get_bootstrap(request: web.Request) -> web.Response:
     conn = _conn(request)
     day = _query_date(request, settings)
     profile = store.get_profile(conn, user["id"])
+    if profile:
+        # Старые профили без даты подписки получают бесплатный период (7 дней).
+        store.grant_trial_if_missing(
+            conn, user["id"], settings.trial_days, settings.ai_trial_days, today=day
+        )
+        profile = store.get_profile(conn, user["id"])
     classes = store.list_classes(conn, user["id"])
     now = calc.local_now(settings.timezone)
     free = is_free_user(settings, user, conn)
@@ -2017,6 +2029,11 @@ async def get_subscription(request: web.Request) -> web.Response:
     conn = _conn(request)
     profile = store.get_profile(conn, user["id"])
     today = calc.local_today(settings_obj.timezone)
+    if profile:
+        store.grant_trial_if_missing(
+            conn, user["id"], settings_obj.trial_days, settings_obj.ai_trial_days, today=today
+        )
+        profile = store.get_profile(conn, user["id"])
     return json_ok(
         _subscription_json(profile, settings_obj, today, is_free_user(settings_obj, user, conn))
     )

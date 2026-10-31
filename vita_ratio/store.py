@@ -944,6 +944,37 @@ def ensure_trial(
     return set_subscription(conn, uid, sub_until=until)
 
 
+def grant_trial_if_missing(
+    conn: sqlite3.Connection,
+    user_id: int,
+    days: int,
+    ai_days: int = 0,
+    today: str | None = None,
+) -> dict:
+    """Выдаёт пропущенный бесплатный период старым профилям (``sub_until``/``ai_until`` = NULL).
+
+    Идемпотентно: сроки выставляются только когда их ещё нет, оплаченные/истёкшие
+    даты не трогаются. Профиля нет — ничего не делает. Возвращает подписку.
+    """
+    uid = int(user_id)
+    profile = get_profile(conn, uid)
+    if not profile:
+        return get_subscription(conn, uid)
+    day = str(today) if today else calc.local_today()
+    current = get_subscription(conn, uid)
+    if current.get("sub_until") is None and int(days or 0) > 0:
+        ensure_trial(conn, uid, days, today=day)
+    if int(ai_days or 0) > 0 and not current.get("ai_until"):
+        try:
+            ai_until = (date_cls.fromisoformat(day) + timedelta(days=int(ai_days))).isoformat()
+        except ValueError:
+            ai_until = None
+        if ai_until:
+            set_subscription(conn, uid, ai_until=ai_until)
+            upsert_profile(conn, uid, {"ai_enabled": 1})
+    return get_subscription(conn, uid)
+
+
 def add_payment(
     conn: sqlite3.Connection,
     user_id: int,
