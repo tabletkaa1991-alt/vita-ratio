@@ -288,6 +288,9 @@ def backup_db(settings_obj: Settings, force: bool = False) -> bool:
         except OSError as exc:
             log.warning("Не удалось проверить БД %s: %s", db_path, exc)
             return False
+        if not settings_obj.backup_enabled:
+            log.info("Бэкап БД пропущен: BACKUP_ENABLED=0")
+            return False
         if not _configured(settings_obj):
             log.info("Бэкап БД пропущен: DATA_REPO/DATA_TOKEN не заданы")
             return False
