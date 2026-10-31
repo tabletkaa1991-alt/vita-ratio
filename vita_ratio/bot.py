@@ -81,7 +81,13 @@ HELP_BODY = """<b>Команды</b>
 /note — заметка с разбором ИИ (например: /note сегодня тяжело, мало спал)
 /notes — последние заметки и ответы ИИ
 /subscription — подписка и оплата (250 ₽/мес, ИИ +100 ₽/мес)
+/whoami — твой Telegram ID и username (нужно для бесплатного доступа)
 /help — эта справка
+
+<b>Владельцу бота</b>
+/grant 123456789 — выдать бесплатный доступ по ID или /grant @username
+/revoke 123456789 — снять бесплатный доступ
+/free_list — кто в бесплатном доступе (БД и env)
 
 Напоминания (приёмы пищи, сон, утренняя сводка) приходят, пока в профиле включён тумблер «Напоминания». Включить и выключить можно в мини-приложении."""
 
@@ -92,7 +98,10 @@ PAYWALL_TEXT = (
     "Оформить или продлить можно командой /subscription — оплата в Telegram Stars."
 )
 #: Команды, которые работают всегда (вне платного гейта).
-FREE_COMMANDS = frozenset({"/start", "/app", "/help", "/subscription"})
+FREE_COMMANDS = frozenset({
+    "/start", "/app", "/help", "/subscription", "/whoami",
+    "/grant", "/revoke", "/free_list",
+})
 #: Команды, которым нужна активная base-подписка.
 GATED_COMMANDS = frozenset({
     "/today", "/plan", "/classes", "/sleep", "/targets", "/note", "/notes", "/export",
@@ -125,8 +134,14 @@ def effective_ai(profile: Any, today: str) -> bool:
     return flag == 1 and _date_active(_dget(profile, "ai_until", None), today)
 
 
-def _is_free_message(settings_obj: Settings, message: Message) -> bool:
-    """True, если отправителю включён бесплатный доступ (CONTRACT §29)."""
+def _is_free_message(
+    settings_obj: Settings, message: Message, conn: sqlite3.Connection | None = None
+) -> bool:
+    """True, если отправителю включён бесплатный доступ (CONTRACT §29).
+
+    ``conn`` передаётся, чтобы учитывать доступ, выданный из бота (/grant):
+    он хранится в таблице ``free_access``.
+    """
     from_user = getattr(message, "from_user", None)
     if from_user is None:
         return False
@@ -134,7 +149,141 @@ def _is_free_message(settings_obj: Settings, message: Message) -> bool:
         settings_obj,
         getattr(from_user, "id", None),
         getattr(from_user, "username", None),
+        conn,
     )
+
+
+# --- бесплатный доступ: команды владельца (/whoami, /grant, /revoke, /free_list) ---
+
+#: Ответ на админ-команду от любого, кроме владельца.
+ADMIN_ONLY_TEXT = "Команда доступна только владельцу бота."
+#: Сколько строк максимум показывает /free_list.
+FREE_LIST_LIMIT = 50
+
+
+def _sender(message: Any) -> Any:
+    """Отправитель сообщения (``message.from_user``) или ``None``."""
+    return getattr(message, "from_user", None)
+
+
+def _sender_id(message: Any) -> Any:
+    """ID отправителя; для сообщений без from_user — id чата."""
+    sender = _sender(message)
+    if sender is not None:
+        return getattr(sender, "id", None)
+    return getattr(getattr(message, "chat", None), "id", None)
+
+
+def _command_args(message: Any) -> str:
+    """Аргумент команды: ``/grant 123`` -> ``"123"`` (пусто, если его нет)."""
+    parts = str(getattr(message, "text", "") or "").split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def is_admin(settings_obj: Settings, message: Any) -> bool:
+    """True, если команду отправил владелец бота (``settings.admin_id``)."""
+    admin_id = getattr(settings_obj, "admin_id", None)
+    sender = _sender(message)
+    if not admin_id or sender is None:
+        return False
+    try:
+        return int(admin_id) == int(getattr(sender, "id", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+
+
+def format_whoami(message: Any) -> str:
+    """Текст /whoami: Telegram ID и username отправителя (для whitelist)."""
+    sender = _sender(message)
+    user_id = _sender_id(message)
+    username = str(getattr(sender, "username", "") or "").strip().lstrip("@")
+    shown = f"@{_esc(username)}" if username else "— (не задан)"
+    id_text = _esc(user_id) if user_id is not None else "—"
+    return f"Твой Telegram ID: {id_text}, username: {shown}"
+
+
+def command_grant(settings_obj: Settings, conn: sqlite3.Connection, message: Any) -> str:
+    """Текст ответа на /grant <id|@username>; проверка владельца внутри."""
+    if not is_admin(settings_obj, message):
+        return ADMIN_ONLY_TEXT
+    value = access.normalize(_command_args(message))
+    if not value:
+        return "Использование: /grant 123456789 или /grant @username"
+    if access.add_free(conn, value):
+        return f"✅ Бесплатный доступ выдан: {_esc(value)}"
+    is_numeric = value.isdigit()
+    already = access.is_free(
+        settings_obj,
+        int(value) if is_numeric else None,
+        None if is_numeric else value,
+        conn,
+    )
+    if already:
+        return f"ℹ️ Бесплатный доступ уже есть: {_esc(value)}"
+    return "😔 Не удалось сохранить бесплатный доступ. Попробуй позже."
+
+
+def command_revoke(settings_obj: Settings, conn: sqlite3.Connection, message: Any) -> str:
+    """Текст ответа на /revoke <id|@username>; проверка владельца внутри."""
+    if not is_admin(settings_obj, message):
+        return ADMIN_ONLY_TEXT
+    value = access.normalize(_command_args(message))
+    if not value:
+        return "Использование: /revoke 123456789 или /revoke @username"
+    if access.remove_free(conn, value):
+        return f"🚫 Бесплатный доступ снят: {_esc(value)}"
+    return f"🚫 Бесплатный доступ не найден: {_esc(value)}"
+
+
+def format_free_list(settings_obj: Settings, rows: list[dict]) -> str:
+    """Текст /free_list: значения из БД и env, до ``FREE_LIST_LIMIT`` строк.
+
+    Всё, что пришло из БД/env, экранируется для HTML-разметки Telegram.
+    """
+    env_ids = access.free_ids(settings_obj)
+    env_names = access.free_usernames(settings_obj)
+    total = len(rows) + len(env_ids) + len(env_names)
+    shown = 0
+    lines = ["📋 <b>Бесплатный доступ</b>", "", "<b>Из бота (БД):</b>"]
+    if rows:
+        for row in rows:
+            if shown >= FREE_LIST_LIMIT:
+                break
+            value = _esc(row.get("value", ""))
+            created = str(row.get("created_at") or "")[:19]
+            lines.append(
+                f"• <code>{value}</code>" + (f" — {_esc(created)}" if created else "")
+            )
+            shown += 1
+    else:
+        lines.append("• пока никого")
+    lines.extend(["", "<b>Из env (Render):</b>"])
+    env_shown = 0
+    for uid in env_ids:
+        if shown >= FREE_LIST_LIMIT:
+            break
+        lines.append(f"• ID <code>{uid}</code>")
+        shown += 1
+        env_shown += 1
+    for name in env_names:
+        if shown >= FREE_LIST_LIMIT:
+            break
+        lines.append(f"• <code>@{_esc(name)}</code>")
+        shown += 1
+        env_shown += 1
+    if not env_shown:
+        lines.append("• пусто")
+    if total > shown:
+        lines.append("")
+        lines.append(f"…и ещё {total - shown} (показаны первые {FREE_LIST_LIMIT})")
+    return "\n".join(lines)
+
+
+def command_free_list(settings_obj: Settings, conn: sqlite3.Connection, message: Any) -> str:
+    """Текст ответа на /free_list; проверка владельца внутри."""
+    if not is_admin(settings_obj, message):
+        return ADMIN_ONLY_TEXT
+    return format_free_list(settings_obj, access.list_free(conn))
 
 
 def format_subscription(
@@ -143,7 +292,7 @@ def format_subscription(
     """Текст /subscription: статус base/ai, даты и цены (или «бесплатно»)."""
     if free:
         return "\n".join([
-            "🎁 <b>Бесплатный доступ включён (бессрочно)</b>",
+            "🎁 Бесплатный доступ включён (бессрочно)",
             "",
             "Бот и мини-приложение Vita Ratio доступны без подписки.",
             "ИИ-разбор заметок и отчётов включён.",
@@ -936,7 +1085,7 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
         """Гейт команд: True — можно выполнять; иначе отправлен paywall."""
         if not (settings_obj.subscription_enforced and not settings_obj.is_dev):
             return True
-        if _is_free_message(settings_obj, message):
+        if _is_free_message(settings_obj, message, conn):
             return True
         user_id = user_id_of(message)
         try:
@@ -954,7 +1103,7 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
     async def send_subscription(message: Message) -> None:
         """Статус подписки + inline-кнопки оплаты base/ai (CONTRACT §24)."""
         user_id = user_id_of(message)
-        free = _is_free_message(settings_obj, message)
+        free = _is_free_message(settings_obj, message, conn)
         try:
             profile = get_profile(conn, user_id)
         except sqlite3.Error:
@@ -996,6 +1145,26 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
     @router.message(Command("subscription"))
     async def cmd_subscription(message: Message) -> None:
         await send_subscription(message)
+
+    @router.message(Command("whoami"))
+    async def cmd_whoami(message: Message) -> None:
+        """ID и username отправителя — чтобы владелец узнал свой Telegram ID."""
+        await answer(message, format_whoami(message))
+
+    @router.message(Command("grant"))
+    async def cmd_grant(message: Message) -> None:
+        """Владелец: выдать бесплатный доступ по ID или @username."""
+        await answer(message, command_grant(settings_obj, conn, message))
+
+    @router.message(Command("revoke"))
+    async def cmd_revoke(message: Message) -> None:
+        """Владелец: снять бесплатный доступ."""
+        await answer(message, command_revoke(settings_obj, conn, message))
+
+    @router.message(Command("free_list"))
+    async def cmd_free_list(message: Message) -> None:
+        """Владелец: список бесплатного доступа из БД и env."""
+        await answer(message, command_free_list(settings_obj, conn, message))
 
     @router.message(Command("start"))
     async def cmd_start(message: Message) -> None:
@@ -1104,7 +1273,7 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
         try:
             profile = get_profile(conn, user_id)
             today = calc.local_today(default_tz)
-            use_llm = _is_free_message(settings_obj, message) or effective_ai(profile, today)
+            use_llm = _is_free_message(settings_obj, message, conn) or effective_ai(profile, today)
             filename, payload = await asyncio.to_thread(
                 reports.build, conn, user_id, period, fmt, use_llm=use_llm)
         except Exception:
@@ -1125,7 +1294,7 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
             await message.answer("✍️ Напиши так: <code>/note сегодня тяжело, мало спал</code>")
             return
         user_id = user_id_of(message)
-        free = _is_free_message(settings_obj, message)
+        free = _is_free_message(settings_obj, message, conn)
         try:
             profile = get_profile(conn, user_id)
             today = calc.local_today(
@@ -1258,6 +1427,10 @@ async def _set_commands(bot: Bot) -> None:
             BotCommand(command="note", description="Заметка с разбором ИИ"),
             BotCommand(command="notes", description="Последние заметки и ответы ИИ"),
             BotCommand(command="subscription", description="Подписка и оплата (Stars)"),
+            BotCommand(command="whoami", description="Мой Telegram ID и username"),
+            BotCommand(command="grant", description="Владелец: выдать бесплатный доступ"),
+            BotCommand(command="revoke", description="Владелец: снять бесплатный доступ"),
+            BotCommand(command="free_list", description="Владелец: список бесплатного доступа"),
             BotCommand(command="help", description="Список команд"),
         ])
     except TelegramAPIError as exc:

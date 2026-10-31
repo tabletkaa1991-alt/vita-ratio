@@ -174,3 +174,11 @@ CREATE TABLE IF NOT EXISTS invoices (
 );
 CREATE INDEX IF NOT EXISTS idx_invoices_user ON invoices(user_id);
 
+-- Бесплатный доступ, управляемый из бота (/grant, /revoke): ID или @username.
+CREATE TABLE IF NOT EXISTS free_access (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    value      TEXT    NOT NULL UNIQUE,  -- "123456789" или "username" (без @, lower)
+    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+

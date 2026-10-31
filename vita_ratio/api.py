@@ -118,11 +118,17 @@ def gate_enabled(settings_obj) -> bool:
     return bool(settings_obj.subscription_enforced) and not settings_obj.is_dev
 
 
-def is_free_user(settings_obj, user: dict | None) -> bool:
-    """True, если пользователю включён бесплатный доступ (CONTRACT §29)."""
+def is_free_user(settings_obj, user: dict | None, conn=None) -> bool:
+    """True, если пользователю включён бесплатный доступ (CONTRACT §29).
+
+    ``conn`` передаётся, чтобы учитывать доступ, выданный из бота (/grant):
+    он хранится в таблице ``free_access``. Ошибки SQLite -> «не free».
+    """
     if not user:
         return False
-    return access.is_free(settings_obj, user.get("id"), user.get("username"))
+    return access.is_free(
+        settings_obj, user.get("id"), user.get("username"), conn
+    )
 
 
 def subscription_gate(
@@ -327,10 +333,11 @@ async def subscription_middleware(request: web.Request, handler) -> web.StreamRe
     if not path.startswith("/api/") or path in SUBSCRIPTION_FREE_PATHS:
         return await handler(request)
     user = auth.authenticate(request, settings_obj)
-    free = is_free_user(settings_obj, user)
+    conn = _conn(request)
+    free = is_free_user(settings_obj, user, conn)
     if free:
         return await handler(request)
-    profile = store.get_profile(_conn(request), user["id"])
+    profile = store.get_profile(conn, user["id"])
     today = calc.local_today(settings_obj.timezone)
     error = subscription_gate(settings_obj, path, profile, today, free=free)
     if error is not None:
@@ -1043,7 +1050,7 @@ async def get_profile(request: web.Request) -> web.Response:
     settings = _settings(request)
     profile = store.get_profile(_conn(request), user["id"])
     today = calc.local_today(settings.timezone)
-    free = is_free_user(settings, user)
+    free = is_free_user(settings, user, _conn(request))
     return json_ok({
         "profile": _profile_json(profile, today, free),
         "targets": _targets_json(profile),
@@ -1070,7 +1077,7 @@ async def put_profile(request: web.Request) -> web.Response:
             store.upsert_profile(conn, user["id"], {"ai_enabled": 1})
         profile = store.get_profile(conn, user["id"]) or profile
     targets = _targets_obj(profile).to_dict()
-    free = is_free_user(settings, user)
+    free = is_free_user(settings, user, conn)
     if existing is None:
         # Первый профиль = онбординг завершён: поздравительное сообщение в чат.
         try:
@@ -1472,7 +1479,7 @@ async def get_notes(request: web.Request) -> web.Response:
     limit = _query_int(request, "limit", 30, 1, 100)
     profile = store.get_profile(conn, user["id"])
     today = calc.local_today(settings.timezone)
-    free = is_free_user(settings, user)
+    free = is_free_user(settings, user, conn)
     return json_ok(
         {
             "notes": [_note_json(row) for row in store.list_notes(conn, user["id"], limit)],
@@ -1490,7 +1497,7 @@ async def post_note(request: web.Request) -> web.Response:
     text = _text_value(payload.get("text"), "text", 2000, required=True)
     profile = store.get_profile(conn, user["id"])
     today = calc.local_today(settings.timezone)
-    ai_enabled = _ai_enabled(profile, today, is_free_user(settings, user))
+    ai_enabled = _ai_enabled(profile, today, is_free_user(settings, user, conn))
     # Модель может думать до 20 с — не блокируем event loop.
     await asyncio.to_thread(
         reports.save_note, conn, user["id"], text, today, ai_enabled=ai_enabled
@@ -1516,7 +1523,7 @@ async def put_ai(request: web.Request) -> web.Response:
         raise _bad("Поле «enabled» должно быть true или false")
     today = calc.local_today(settings.timezone)
     profile = store.get_profile(conn, user["id"])
-    free = is_free_user(settings, user)
+    free = is_free_user(settings, user, conn)
     if enabled and gate_enabled(settings) and not free and not ai_active(profile, today):
         raise ApiError(
             402,
@@ -1580,7 +1587,7 @@ async def post_weekly(request: web.Request) -> web.Response:
     return json_ok(
         {
             "checkin": _checkin_json(checkin),
-            "profile": _profile_json(profile, day, is_free_user(settings, user)),
+            "profile": _profile_json(profile, day, is_free_user(settings, user, conn)),
             "targets": _targets_json(profile),
             "goal": _goal_payload(conn, user["id"], profile, day, trend),
         }
@@ -1787,7 +1794,7 @@ async def get_bootstrap(request: web.Request) -> web.Response:
     profile = store.get_profile(conn, user["id"])
     classes = store.list_classes(conn, user["id"])
     now = calc.local_now(settings.timezone)
-    free = is_free_user(settings, user)
+    free = is_free_user(settings, user, conn)
 
     meals = [_meal_json(row) for row in store.list_meals(conn, user["id"], day)]
     totals = _totals_json(conn, user["id"], day)
@@ -1902,7 +1909,7 @@ async def get_subscription(request: web.Request) -> web.Response:
     profile = store.get_profile(conn, user["id"])
     today = calc.local_today(settings_obj.timezone)
     return json_ok(
-        _subscription_json(profile, settings_obj, today, is_free_user(settings_obj, user))
+        _subscription_json(profile, settings_obj, today, is_free_user(settings_obj, user, conn))
     )
 
 
@@ -2260,7 +2267,7 @@ async def post_pay_refresh(request: web.Request) -> web.Response:
     profile = store.get_profile(conn, user["id"])
     today = calc.local_today(settings_obj.timezone)
     return json_ok(
-        _subscription_json(profile, settings_obj, today, is_free_user(settings_obj, user))
+        _subscription_json(profile, settings_obj, today, is_free_user(settings_obj, user, conn))
     )
 
 
@@ -2275,7 +2282,7 @@ async def get_export(request: web.Request) -> web.Response:
     fmt = (request.query.get("fmt") or "png").lower()
     profile = store.get_profile(conn, user["id"])
     today = calc.local_today(settings_obj.timezone)
-    use_llm = effective_ai(profile, today, is_free_user(settings_obj, user))
+    use_llm = effective_ai(profile, today, is_free_user(settings_obj, user, conn))
     try:
         filename, payload = await asyncio.to_thread(
             reports.build, conn, user["id"], period, fmt, use_llm=use_llm)

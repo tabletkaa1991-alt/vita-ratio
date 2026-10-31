@@ -68,6 +68,12 @@ class Settings:
     # и/или username без @ через запятую (регистр не важен).
     free_access_ids: str = ""
     free_access_usernames: str = ""
+    # Персистентность базы между пересборками Render: бэкап SQLite в приватный GitHub-репозиторий.
+    data_repo: str = ""          # "owner/vita-ratio-data"
+    data_token: str = ""         # GitHub-токен с правом contents:write на этот репозиторий
+    data_branch: str = "main"
+    backup_enabled: bool = True
+    backup_interval_sec: int = 300
 
     @property
     def webapp_dir(self) -> Path:
@@ -137,4 +143,9 @@ def settings(from_env: bool = True) -> Settings:
         robokassa_password2=get("ROBOKASSA_PASSWORD2", "").strip(),
         free_access_ids=get("FREE_ACCESS_IDS", "").strip(),
         free_access_usernames=get("FREE_ACCESS_USERNAMES", "").strip(),
+        data_repo=get("DATA_REPO", "").strip(),
+        data_token=get("DATA_TOKEN", "").strip(),
+        data_branch=get("DATA_BRANCH", "main").strip() or "main",
+        backup_enabled=get("BACKUP_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"},
+        backup_interval_sec=_as_int(get("BACKUP_INTERVAL_SEC", "300"), 300),
     )

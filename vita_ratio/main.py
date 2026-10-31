@@ -8,17 +8,46 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import signal
 import sys
 
 from aiohttp import web
 
-from . import __version__, db
+from . import __version__, db, persistence
 from .config import settings
 
 
 log = logging.getLogger("vita_ratio")
+
+#: Финальный бэкап при остановке не должен задерживать завершение дольше этого.
+FINAL_BACKUP_TIMEOUT_SEC = 10.0
+
+
+async def _restore_database(settings_obj) -> bool:
+    """Пробует восстановить БД из GitHub до открытия соединения (ошибки не мешают)."""
+    try:
+        return await asyncio.to_thread(persistence.restore_db, settings_obj)
+    except Exception:  # noqa: BLE001 — старт не должен падать из-за бэкапа
+        log.exception("Восстановление БД из GitHub не удалось — продолжаем без него")
+        return False
+
+
+async def _final_backup(settings_obj) -> None:
+    """Последний бэкап при остановке: не дольше 10 с, ошибки только в лог."""
+    try:
+        uploaded = await asyncio.wait_for(
+            asyncio.to_thread(persistence.backup_db, settings_obj, True),
+            timeout=FINAL_BACKUP_TIMEOUT_SEC,
+        )
+        log.info("Финальный бэкап БД: %s", "загружен" if uploaded else "пропущен")
+    except asyncio.TimeoutError:
+        log.warning("Финальный бэкап БД не уложился в %.0f с", FINAL_BACKUP_TIMEOUT_SEC)
+    except asyncio.CancelledError:
+        log.warning("Финальный бэкап БД прерван остановкой")
+    except Exception:  # noqa: BLE001 — остановка не должна падать из-за бэкапа
+        log.exception("Финальный бэкап БД не удался")
 
 
 async def _start_server(settings_obj, conn) -> web.AppRunner:
@@ -36,11 +65,17 @@ async def _start_server(settings_obj, conn) -> web.AppRunner:
 
 async def _run(mode: str) -> None:
     settings_obj = settings()
+    # Render Free теряет диск при рестарте: сначала пробуем вернуть БД из GitHub,
+    # и только потом открываем соединение — закрывать/переоткрывать не требуется.
+    restored = await _restore_database(settings_obj)
     conn = db.connect(settings_obj.db_path)
     db.init_db(conn)
+    if restored:
+        log.info("БД восстановлена — соединение открыто с восстановленным файлом")
 
     runner: web.AppRunner | None = None
     tasks: list[asyncio.Task] = []
+    backup_task: asyncio.Task | None = None
     try:
         if mode in ("server", "all"):
             try:
@@ -58,6 +93,15 @@ async def _run(mode: str) -> None:
         if not tasks and runner is None:
             raise SystemExit("Нечего запускать: выбери server, bot или all")
 
+        if persistence.backup_configured(settings_obj):
+            backup_task = asyncio.create_task(
+                persistence.backup_loop(settings_obj), name="vita-backup"
+            )
+        else:
+            log.info(
+                "Фоновый бэкап БД выключен: задай DATA_REPO и DATA_TOKEN (BACKUP_ENABLED=1)"
+            )
+
         if tasks and runner is not None:
             # Сервер обязан жить, даже если бот завершился (например, пустой BOT_TOKEN).
             await asyncio.gather(*tasks)
@@ -72,6 +116,15 @@ async def _run(mode: str) -> None:
             await runner.cleanup()
         for task in tasks:
             task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        if backup_task is not None:
+            backup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await backup_task
+            # Лучшие усилия: последний снимок перед тем, как Render убьёт контейнер.
+            await _final_backup(settings_obj)
         conn.close()
 
 
