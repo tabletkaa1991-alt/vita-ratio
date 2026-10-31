@@ -180,10 +180,23 @@ def _local_comment(data: dict) -> str:
     return " ".join(tips[:5])
 
 
-# --- настоящая LLM (бесплатный text-API, без ключа) ---------------------------
+# --- настоящая LLM --------------------------------------------------------------
+# Бесплатные варианты:
+#   * по умолчанию Pollinations — без ключа и регистрации;
+#   * если заданы AI_PROVIDER + AI_API_KEY — Gemini / Groq / OpenRouter / OpenAI
+#     (любой OpenAI-совместимый через AI_BASE_URL). При сбое — снова Pollinations.
 
-LLM_URL = "https://text.pollinations.ai/openai"
-LLM_MODEL = os.environ.get("AI_MODEL", "openai")
+SYSTEM = ("Ты нутрициолог-коуч приложения Vita Ratio. Отвечай по-русски, 2-4 предложения, "
+          "конкретно и дружелюбно. Без списков и markdown.")
+
+POLL_URL = "https://text.pollinations.ai/openai"
+OPENAI_COMPAT = {
+    "groq": ("https://api.groq.com/openai/v1/chat/completions", "openai/gpt-oss-120b"),
+    "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "meta-llama/llama-3.3-70b-instruct:free"),
+    "openai": ("https://api.openai.com/v1/chat/completions", "gpt-4o-mini"),
+}
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 
 def _prompt(data: dict) -> str:
@@ -208,14 +221,57 @@ def _prompt(data: dict) -> str:
     return "\n".join(lines)
 
 
-def _llm_comment(prompt: str) -> str | None:
-    """Запрос к бесплатной LLM (GET, затем POST). None при сбое — вызывающий уйдёт в фолбэк."""
-    system = ("Ты нутрициолог-коуч приложения Vita Ratio. Отвечай по-русски, 2-4 предложения, "
-              "конкретно и дружелюбно. Без списков и markdown.")
-    quoted = urllib.parse.quote(f"{system}\n\nДанные пользователя:\n{prompt}", safe="")
+def _provider_comment(prompt: str) -> str | None:
+    """Запрос к провайдеру с ключом (Gemini/Groq/OpenRouter/OpenAI). None при сбое."""
+    provider = os.environ.get("AI_PROVIDER", "").strip().lower()
+    api_key = os.environ.get("AI_API_KEY", "").strip()
+    if not provider or not api_key:
+        return None
+    model = os.environ.get("AI_MODEL", "").strip()
+    try:
+        if provider == "gemini":
+            body = json.dumps({
+                "contents": [{"parts": [{"text": f"{SYSTEM}\n\nДанные пользователя:\n{prompt}"}]}],
+                "generationConfig": {"temperature": 0.6, "maxOutputTokens": 220},
+            }).encode("utf-8")
+            url = GEMINI_URL.format(model=model or GEMINI_MODEL, key=api_key)
+            headers = {"Content-Type": "application/json", "User-Agent": "vita-ratio/1.0"}
+        else:
+            base, default_model = OPENAI_COMPAT.get(provider, (os.environ.get("AI_BASE_URL", ""), ""))
+            if not base:
+                return None
+            body = json.dumps({
+                "model": model or default_model,
+                "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
+                "temperature": 0.6,
+                "max_tokens": 220,
+            }).encode("utf-8")
+            url = base
+            headers = {"Content-Type": "application/json", "User-Agent": "vita-ratio/1.0",
+                       "Authorization": f"Bearer {api_key}"}
+        request = urllib.request.Request(url, data=body, method="POST", headers=headers)
+        with urllib.request.urlopen(request, timeout=25) as response:
+            payload = json.loads(response.read())
+        if provider == "gemini":
+            text = payload["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            text = payload["choices"][0]["message"]["content"]
+        text = (text or "").strip()[:1500]
+        if text:
+            log.info("ai: ответ %s (%s)", provider, model or "default")
+        return text or None
+    except Exception as exc:
+        log.warning("ai: провайдер %s не сработал (%s: %s)", provider, type(exc).__name__, str(exc)[:120])
+        return None
+
+
+def _pollinations_comment(prompt: str) -> str | None:
+    """Бесплатный fallback без ключа: GET, затем POST. None при сбое."""
+    model = os.environ.get("AI_POLL_MODEL", "openai")
+    quoted = urllib.parse.quote(f"{SYSTEM}\n\nДанные пользователя:\n{prompt}", safe="")
     try:
         with urllib.request.urlopen(
-            f"https://text.pollinations.ai/{quoted}?model={LLM_MODEL}&private=true", timeout=15
+            f"https://text.pollinations.ai/{quoted}?model={model}&private=true", timeout=15
         ) as response:
             text = response.read().decode("utf-8", "ignore").strip()
         if text and not text.startswith("{"):
@@ -223,13 +279,13 @@ def _llm_comment(prompt: str) -> str | None:
     except Exception as exc:
         log.warning("ai: GET не сработал (%s: %s)", type(exc).__name__, str(exc)[:100])
     body = json.dumps({
-        "model": LLM_MODEL,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+        "model": model,
+        "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
         "temperature": 0.6,
         "max_tokens": 220,
     }).encode("utf-8")
     request = urllib.request.Request(
-        LLM_URL, data=body, method="POST",
+        POLL_URL, data=body, method="POST",
         headers={"Content-Type": "application/json", "User-Agent": "vita-ratio/1.0"},
     )
     try:
@@ -241,6 +297,11 @@ def _llm_comment(prompt: str) -> str | None:
         return None
 
 
+def _llm_comment(prompt: str) -> str | None:
+    """Ответ модели: провайдер с ключом (если настроен), иначе бесплатный Pollinations."""
+    return _provider_comment(prompt) or _pollinations_comment(prompt)
+
+
 def ai_comment(data: dict, use_llm: bool | None = None) -> str:
     """Ответ ИИ: реальная модель (бесплатный API) либо локальный коуч при недоступности."""
     if use_llm is None:
@@ -248,7 +309,7 @@ def ai_comment(data: dict, use_llm: bool | None = None) -> str:
     if use_llm and data["totals"]["days_with_food"]:
         text = _llm_comment(_prompt(data))
         if text:
-            log.info("ai: ответ модели получен (%s)", LLM_MODEL)
+            log.info("ai: ответ модели получен")
             return text
     return _local_comment(data)
 
