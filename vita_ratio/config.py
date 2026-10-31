@@ -123,6 +123,7 @@ def settings(from_env: bool = True) -> Settings:
         ai_price_stars=_as_int(get("AI_PRICE_STARS", "60"), 60),
         sub_period_days=_as_int(get("SUB_PERIOD_DAYS", "30"), 30),
         trial_days=_as_int(get("TRIAL_DAYS", "7"), 7),
+        ai_trial_days=_as_int(get("AI_TRIAL_DAYS", "0"), 0),
         subscription_enforced=enforced_raw not in {"0", "false", "no", "off"},
         pay_provider=get("PAY_PROVIDER", "stars").strip().lower() or "stars",
         yookassa_shop_id=get("YOOKASSA_SHOP_ID", "").strip(),
