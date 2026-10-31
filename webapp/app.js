@@ -105,8 +105,11 @@
       daySuggestions: []
     },
     progress: { weights: null, stats: null, loading: false },
-    /* Заметки и ИИ (CONTRACT §20): отдельная загрузка, не блокирует «Прогресс». */
-    notes: { items: [], aiEnabled: false, loading: false, loaded: false, reload: false, saving: false, busy: false },
+    /* Чат ИИ (CONTRACT §20/§25): отдельная загрузка, не блокирует остальные экраны. */
+    notes: {
+      items: [], aiEnabled: false, loading: false, loaded: false, reload: false,
+      saving: false, busy: false, pending: null, aiMissing: false
+    },
     /* Подписка (CONTRACT §22–25): GET /api/subscription + bootstrap.subscription. */
     subscription: { data: null, loading: false, loaded: false, reload: false, missing: false },
     pay: { baseBusy: false, aiBusy: false, forcePaywall: false },
@@ -718,7 +721,12 @@
     }
     if (tab === 'progress' && !opts.noLoad) {
       loadProgress();
-      loadNotes();
+    }
+    if (tab === 'ai' && !opts.noLoad) {
+      /* Экран ИИ: история чата и актуальный статус подписки/аддона. */
+      renderAiScreen();
+      loadAiHistory();
+      loadSubscription();
     }
   }
 
@@ -795,8 +803,8 @@
       renderProfileForm();
       renderPalette();
       if (state.progress.stats) { renderStats(); }
-      renderNotesToggle();
     }
+    if (state.tab === 'ai') { renderAiScreen(); }
     if (state.tab === 'schedule' && state.schedule.day) { renderDayPlan(); }
   }
 
@@ -929,32 +937,6 @@
     node.classList.toggle('subscription-status--trial', sub.active && subscriptionIsTrial(sub));
   }
 
-  function renderAiAddon(sub) {
-    var addon = byId('ai-addon');
-    var title = byId('ai-addon-title');
-    var activeUntil = byId('ai-active-until');
-    var note = byId('ai-addon-note');
-    var aiActive = sub ? sub.ai_active === true : null;
-    /* Плашка-аддон заменяет тумблер только когда подписка известна и ИИ не активен. */
-    if (addon) { addon.hidden = !(sub && aiActive === false); }
-    if (title && sub) {
-      title.textContent = 'ИИ-разбор — +' + fmtInt(sub.ai_price_rub) + ' ₽/мес';
-    }
-    if (activeUntil) {
-      if (sub && aiActive === true && sub.ai_until) {
-        activeUntil.textContent = 'ИИ активен до ' + dateShort(sub.ai_until);
-        activeUntil.hidden = false;
-      } else {
-        activeUntil.textContent = '';
-        activeUntil.hidden = true;
-      }
-    }
-    if (note && (!sub || aiActive !== false)) {
-      note.textContent = '';
-      note.hidden = true;
-    }
-  }
-
   function renderSubscription() {
     var sub = subscriptionPayload();
     if (sub && sub.active === true) { state.pay.forcePaywall = false; }
@@ -963,8 +945,8 @@
     }
     renderPaywall(sub);
     renderSubscriptionStatus(sub);
-    renderAiAddon(sub);
-    renderNotesToggle();
+    /* Экран ИИ сам решает, показать поле ввода или плашку +100 ₽/мес. */
+    renderAiScreen();
   }
 
   function loadSubscription(options) {
@@ -1064,7 +1046,7 @@
   }
 
   function showInvoiceHint(kind, url) {
-    var node = kind === 'ai' ? byId('ai-addon-note') : byId('sub-pay-note');
+    var node = kind === 'ai' ? byId('ai-paywall-note') : byId('sub-pay-note');
     if (!node) { return; }
     var prefix = kind === 'ai' ? 'Подключить ИИ можно в Telegram:' : 'Оплатить можно в Telegram:';
     node.innerHTML = esc(prefix) + ' <a href="' + esc(url) +
@@ -1073,7 +1055,7 @@
   }
 
   function hideInvoiceHint(kind) {
-    var node = kind === 'ai' ? byId('ai-addon-note') : byId('sub-pay-note');
+    var node = kind === 'ai' ? byId('ai-paywall-note') : byId('sub-pay-note');
     if (node) {
       node.textContent = '';
       node.hidden = true;
@@ -1092,10 +1074,11 @@
         /* Оплатили аддон — включаем ИИ и перечитываем профиль/подписку/заметки. */
         apiRequest('PUT', '/api/ai', { enabled: true }).then(function () {
           setAiEnabled(true);
-          renderNotesToggle();
+          state.notes.aiMissing = false;
+          renderAiScreen();
           toast('ИИ-разбор подключён');
           afterPaymentRefresh();
-          loadNotes();
+          loadAiHistory();
         }).catch(function (error) {
           var code = error && error.code;
           if (code === 'base_required' || code === 'subscription_required' || code === 'http_402') {
@@ -1168,7 +1151,7 @@
 
   function payAi() {
     if (state.pay.aiBusy) { return; }
-    var button = byId('ai-addon-btn');
+    var button = byId('ai-subscribe-btn');
     state.pay.aiBusy = true;
     setBusy(button, true);
     hideInvoiceHint('ai');
@@ -3765,7 +3748,7 @@
     });
   }
 
-  /* ======================= «Прогресс»: заметки и ИИ (v4) ======================= */
+  /* ======================= экран «ИИ»: чат-коуч (v6) ======================= */
 
   var NOTE_MAX_LENGTH = 2000;
 
@@ -3789,29 +3772,86 @@
     if (profile) { profile.ai_enabled = value; }
   }
 
-  function renderNotesToggle() {
-    var enabled = aiEnabledNow();
+  function aiSubActive(sub) {
+    return !!(sub && sub.ai_active === true);
+  }
+
+  function aiPriceLabel(sub) {
+    var rub = sub ? sub.ai_price_rub : SUBSCRIPTION_DEFAULTS.ai_price_rub;
+    return '+' + fmtInt(rub) + ' ₽/мес';
+  }
+
+  function aiStatusText(sub) {
+    if (!sub) { return 'ИИ ' + aiPriceLabel(null); }
+    if (sub.ai_active === true) {
+      return sub.ai_until ? 'ИИ включён до ' + dateShort(sub.ai_until) : 'ИИ включён';
+    }
+    if (subscriptionIsTrial(sub)) {
+      var until = sub.trial_until || sub.until;
+      return until ? 'Пробный период до ' + dateShort(until) : 'Пробный период';
+    }
+    return 'ИИ ' + aiPriceLabel(sub);
+  }
+
+  /* Единый рендер экрана ИИ: статус подписки, paywall аддона, плашка
+     «ИИ выключен», поле ввода и история чата. */
+  function renderAiScreen() {
     var sub = subscriptionPayload();
-    /* Если подписка известна и ИИ-аддон не активен — вместо тумблера
-       показываем плашку «ИИ-разбор — +100 ₽/мес» и кнопку (CONTRACT §25). */
-    var addonMode = !!(sub && sub.ai_active !== true);
-    var toggle = byId('ai-toggle');
-    var label = byId('ai-toggle-label');
-    var hint = byId('ai-toggle-hint');
-    var plaque = byId('notes-ai-off');
-    if (toggle) {
-      toggle.hidden = addonMode;
-      toggle.setAttribute('aria-checked', enabled ? 'true' : 'false');
-      toggle.disabled = !!state.notes.busy;
-      toggle.classList.toggle('is-busy', !!state.notes.busy);
+    var active = aiSubActive(sub);
+    var enabled = aiEnabledNow();
+
+    var status = byId('ai-screen-status');
+    if (status) {
+      status.textContent = aiStatusText(sub);
+      status.classList.toggle('is-active', active);
+      status.classList.toggle('is-trial', !active && subscriptionIsTrial(sub));
     }
-    if (label) {
-      label.textContent = enabled ? 'ИИ включён' : 'Включить ИИ';
-      label.classList.toggle('is-on', enabled);
-      label.classList.toggle('is-off', !enabled);
+
+    /* Нет активного аддона — вместо поля ввода показываем paywall (CONTRACT §25). */
+    var composer = byId('ai-composer');
+    if (composer) { composer.hidden = !active; }
+
+    var paywall = byId('ai-paywall');
+    if (paywall) { paywall.hidden = active; }
+    var price = byId('ai-paywall-price');
+    if (price) { price.textContent = aiPriceLabel(sub); }
+    var payText = byId('ai-paywall-text');
+    if (payText) {
+      if (!sub) {
+        payText.textContent = 'Не удалось проверить подписку — обнови экран.';
+      } else if (sub.active !== true) {
+        payText.textContent = 'Сначала оформи подписку Vita Ratio — ' +
+          fmtInt(sub.base_price_rub) + ' ₽/мес.';
+      } else {
+        payText.textContent = 'ИИ-коуч разбирает заметки и подсказывает, что поправить в питании, сне и тренировках.';
+      }
     }
-    if (hint) { hint.hidden = enabled || addonMode; }
-    if (plaque) { plaque.hidden = enabled || addonMode; }
+    var subscribeBtn = byId('ai-subscribe-btn');
+    if (subscribeBtn) {
+      subscribeBtn.textContent = 'Подключить ИИ · ' + aiPriceLabel(sub);
+      setBusy(subscribeBtn, !!state.pay.aiBusy);
+    }
+
+    /* ai_active=true, но пользователь выключил разбор — плашка с кнопкой. */
+    var offBanner = byId('ai-off-banner');
+    var showOff = active && (!enabled || state.notes.aiMissing);
+    if (offBanner) { offBanner.hidden = !showOff; }
+    var offText = byId('ai-off-banner-text');
+    if (offText) {
+      offText.textContent = state.notes.aiMissing && enabled
+        ? 'ИИ не ответил — попробуй ещё раз'
+        : 'ИИ выключен';
+    }
+    var enableBtn = byId('ai-enable-btn');
+    if (enableBtn) {
+      enableBtn.textContent = enabled ? 'Обновить' : 'Включить ИИ';
+      setBusy(enableBtn, !!state.notes.busy);
+    }
+
+    var send = byId('ai-send');
+    if (send) { setBusy(send, !!state.notes.saving); }
+
+    renderAiChat();
   }
 
   function noteDateText(note) {
@@ -3820,138 +3860,204 @@
     return dateShort(iso);
   }
 
-  function noteItemHtml(note) {
+  function aiNoteHtml(note) {
     var dateText = noteDateText(note);
     var aiText = String((note && note.ai_text) || '').trim();
-    return '<li class="note-item">' +
-      (dateText ? '<span class="note-item__date">' + esc(dateText) + '</span>' : '') +
-      '<p class="note-item__text">' + esc((note && note.text) || '') + '</p>' +
-      (aiText ? '<p class="note-item__ai">🤖 ' + esc(aiText) + '</p>' : '') +
+    var html = '<li class="ai-msg ai-msg--user">' +
+      (dateText ? '<span class="ai-msg__meta">' + esc(dateText) + '</span>' : '') +
+      '<p class="ai-msg__text">' + esc((note && note.text) || '') + '</p>' +
     '</li>';
-  }
-
-  function renderNotes() {
-    var list = byId('notes-list');
-    var empty = byId('notes-empty');
-    if (!list || !empty) { return; }
-    var items = state.notes.items || [];
-    if (!items.length) {
-      list.innerHTML = '';
-      if (state.notes.loading) {
-        empty.textContent = 'Загружаю заметки…';
-      } else if (state.notes.loaded) {
-        empty.textContent = 'Заметок пока нет — добавь первую.';
-      } else {
-        empty.textContent = 'Заметки не загрузились — попробуй позже.';
-      }
-      empty.hidden = false;
-      renderNotesToggle();
-      return;
+    if (aiText) {
+      html += '<li class="ai-msg ai-msg--ai">' +
+        '<span class="ai-msg__meta">🤖 ИИ-коуч</span>' +
+        '<p class="ai-msg__text">' + esc(aiText) + '</p>' +
+      '</li>';
     }
-    empty.hidden = true;
-    list.innerHTML = items.map(noteItemHtml).join('');
-    renderNotesToggle();
+    return html;
   }
 
-  /* Список грузится отдельным запросом: медленный /api/notes не держит
-     графики и профиль, а ошибка остаётся тихой (без тоста). */
-  function loadNotes() {
+  function renderAiChat() {
+    var list = byId('ai-chat-list');
+    var empty = byId('ai-chat-empty');
+    var typing = byId('ai-typing');
+    if (!list || !empty) { return; }
+    /* API отдаёт новые сверху — в чате показываем старые сверху, новые снизу. */
+    var items = (state.notes.items || []).slice().reverse();
+    var html = items.map(aiNoteHtml).join('');
+    if (state.notes.pending) {
+      html += '<li class="ai-msg ai-msg--user ai-msg--pending">' +
+        '<span class="ai-msg__meta">Сейчас</span>' +
+        '<p class="ai-msg__text">' + esc(state.notes.pending) + '</p>' +
+      '</li>';
+    }
+    list.innerHTML = html;
+    /* Индикатор «ИИ печатает…» (#ai-typing) виден, пока ждём POST /api/notes. */
+    if (typing) { typing.hidden = !state.notes.saving; }
+    var hasMessages = items.length > 0 || !!state.notes.pending;
+    empty.hidden = hasMessages;
+    if (!hasMessages) {
+      if (state.notes.loading) {
+        empty.textContent = 'Загружаю историю…';
+      } else if (state.notes.loaded) {
+        empty.textContent = aiSubActive(subscriptionPayload())
+          ? 'Пока пусто — напиши первую заметку, и ИИ-коуч разберёт её.'
+          : 'ИИ пока не подключён. Подключи разбор — и начнём с заметок.';
+      } else {
+        empty.textContent = 'История не загрузилась — попробуй позже.';
+      }
+    }
+  }
+
+  function scrollAiToBottom() {
+    window.setTimeout(function () {
+      try {
+        window.scrollTo(0, document.body.scrollHeight);
+      } catch (error) { /* noop */ }
+    }, 40);
+  }
+
+  /* История грузится отдельным запросом: медленный /api/notes не блокирует
+     остальные экраны, а ошибка остаётся тихой (без тоста). */
+  function loadAiHistory() {
     if (state.notes.loading) {
       state.notes.reload = true;
       return;
     }
     state.notes.loading = true;
-    renderNotes();
+    renderAiChat();
     apiRequest('GET', '/api/notes?limit=30').then(function (data) {
       state.notes.loading = false;
       state.notes.loaded = true;
       state.notes.items = ((data && data.notes) || []).slice(0, 30);
       if (data && typeof data.ai_enabled === 'boolean') { setAiEnabled(data.ai_enabled); }
-      renderNotes();
+      renderAiScreen();
       if (state.notes.reload) {
         state.notes.reload = false;
-        loadNotes();
+        loadAiHistory();
       }
     }).catch(function () {
       state.notes.loading = false;
       if (!state.notes.loaded) { state.notes.items = []; }
-      renderNotes();
+      renderAiChat();
       if (state.notes.reload) {
         state.notes.reload = false;
-        loadNotes();
+        loadAiHistory();
       }
     });
   }
 
-  function toggleAi() {
+  function aiErrorToast(code) {
+    if (code === 'ai_subscription_required') {
+      toast('ИИ-разбор — отдельный аддон +100 ₽/мес.', 'error');
+      loadSubscription();
+      return;
+    }
+    if (code === 'subscription_required' || code === 'http_402') {
+      toast('Нужна подписка Vita Ratio — 250 ₽/мес.', 'error');
+      loadSubscription();
+      return;
+    }
+    toast(code === 'http_404' || code === 'not_found'
+      ? 'ИИ пока недоступен — попробуй позже.'
+      : errorText(code), 'error');
+  }
+
+  function enableAi() {
     if (state.notes.busy) { return; }
-    var next = !aiEnabledNow();
+    if (aiEnabledNow()) {
+      /* «Обновить»: перечитываем статус и историю после ручной правки. */
+      loadAiHistory();
+      loadSubscription();
+      return;
+    }
     state.notes.busy = true;
-    renderNotesToggle();
+    renderAiScreen();
     haptic('select');
-    apiRequest('PUT', '/api/ai', { enabled: next }).then(function (data) {
+    apiRequest('PUT', '/api/ai', { enabled: true }).then(function (data) {
       state.notes.busy = false;
-      var enabled = data && typeof data.ai_enabled === 'boolean' ? data.ai_enabled : next;
-      setAiEnabled(enabled);
-      renderNotesToggle();
+      setAiEnabled(data && typeof data.ai_enabled === 'boolean' ? data.ai_enabled : true);
+      state.notes.aiMissing = false;
+      renderAiScreen();
       haptic('success');
-      toast(enabled ? 'ИИ включён — новые заметки получат разбор' : 'ИИ-разбор заметок выключен');
+      toast('ИИ включён — новые заметки получат разбор');
+      loadAiHistory();
     }).catch(function (error) {
       state.notes.busy = false;
-      renderNotesToggle();
+      renderAiScreen();
       haptic('error');
-      var code = error && error.code;
-      if (code === 'ai_subscription_required') {
-        toast('ИИ-разбор — отдельный аддон +100 ₽/мес.', 'error');
-        loadSubscription();
-        return;
-      }
-      if (code === 'subscription_required') {
-        toast('Нужна подписка Vita Ratio — 250 ₽/мес.', 'error');
-        loadSubscription();
-        return;
-      }
-      toast(code === 'http_404' || code === 'not_found'
-        ? 'ИИ пока недоступен — попробуй позже.'
-        : errorText(code), 'error');
+      aiErrorToast(error && error.code);
     });
   }
 
-  function submitNote(event) {
-    event.preventDefault();
+  function syncAiInputHeight() {
+    var input = byId('ai-input');
+    if (!input) { return; }
+    input.style.height = 'auto';
+    input.style.height = Math.min(Math.max(input.scrollHeight, 44), 120) + 'px';
+  }
+
+  function onAiInputKeydown(event) {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      submitAiMessage(event);
+    }
+  }
+
+  function submitAiMessage(event) {
+    if (event && typeof event.preventDefault === 'function') { event.preventDefault(); }
     if (state.notes.saving) { return; }
-    var input = byId('note-text');
+    var input = byId('ai-input');
     var text = String(input ? input.value : '').trim();
     if (!text) {
-      toast('Напиши текст заметки', 'error');
+      toast('Напиши сообщение', 'error');
       haptic('error');
       if (input) { try { input.focus(); } catch (error) { /* noop */ } }
       return;
     }
     if (text.length > NOTE_MAX_LENGTH) {
-      toast('Заметка — до ' + NOTE_MAX_LENGTH + ' символов', 'error');
+      toast('Сообщение — до ' + NOTE_MAX_LENGTH + ' символов', 'error');
       haptic('error');
       return;
     }
-    var button = byId('note-submit');
+    if (!aiSubActive(subscriptionPayload())) {
+      toast('ИИ не подключён — подключи +100 ₽/мес', 'error');
+      renderAiScreen();
+      return;
+    }
+    var send = byId('ai-send');
     state.notes.saving = true;
-    setBusy(button, true);
+    state.notes.pending = text;
+    state.notes.aiMissing = false;
+    if (input) { input.value = ''; syncAiInputHeight(); }
+    setBusy(send, true);
+    renderAiChat();
+    scrollAiToBottom();
+    haptic('select');
     apiRequest('POST', '/api/notes', { text: text }).then(function (data) {
       state.notes.saving = false;
-      setBusy(button, false);
-      haptic('success');
+      state.notes.pending = null;
       if (data && typeof data.ai_enabled === 'boolean') { setAiEnabled(data.ai_enabled); }
-      if (input) { input.value = ''; }
-      toast('Заметка сохранена');
-      loadNotes();
+      var note = (data && data.note) || { date: todayIso(), text: text, ai_text: '' };
+      if (!note.text) { note.text = text; }
+      var aiText = String(note.ai_text || '').trim();
+      state.notes.aiMissing = !aiText;
+      state.notes.items = [note].concat(state.notes.items || []).slice(0, 30);
+      state.notes.loaded = true;
+      renderAiScreen();
+      haptic(aiText ? 'success' : 'warning');
+      if (!aiText) {
+        toast('ИИ выключен — заметка сохранена без разбора');
+      }
+      scrollAiToBottom();
+      loadAiHistory(); // сверяем локальную запись с сервером
     }).catch(function (error) {
       state.notes.saving = false;
-      setBusy(button, false);
+      state.notes.pending = null;
+      setBusy(send, false);
+      if (input && !input.value) { input.value = text; syncAiInputHeight(); }
+      renderAiScreen();
       haptic('error');
-      var code = error && error.code;
-      toast(code === 'http_404' || code === 'not_found'
-        ? 'Заметки пока недоступны — попробуй позже.'
-        : errorText(code), 'error'); /* поле не очищаем — текст не теряется */
+      aiErrorToast(error && error.code); /* текст не теряем */
     });
   }
 
@@ -4347,13 +4453,16 @@
       byId(id).addEventListener('input', applyThemeFromInputs);
     });
     byId('btn-theme-reset').addEventListener('click', resetTheme);
-    // Заметки и ИИ (v4): подпись внутри кнопки, клик по ней — тот же тумблер
-    byId('ai-toggle').addEventListener('click', toggleAi);
-    byId('note-form').addEventListener('submit', submitNote);
+
+    // Экран «ИИ»: чат-коуч и аддон ИИ (v6)
+    byId('ai-composer').addEventListener('submit', submitAiMessage);
+    byId('ai-input').addEventListener('input', syncAiInputHeight);
+    byId('ai-input').addEventListener('keydown', onAiInputKeydown);
+    byId('ai-enable-btn').addEventListener('click', enableAi);
 
     // Подписка (v5): блокирующий paywall и аддон ИИ
     byId('sub-pay-btn').addEventListener('click', payBase);
-    byId('ai-addon-btn').addEventListener('click', payAi);
+    byId('ai-subscribe-btn').addEventListener('click', payAi);
 
     // Онбординг
     byId('onb-next').addEventListener('click', function () { goOnbStep(1); });

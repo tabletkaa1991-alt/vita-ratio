@@ -693,42 +693,7 @@
             </div>
           </article>
 
-          <article id="notes-card" class="card" aria-label="Заметки и ИИ">
-            <div class="card__head">
-              <p class="card__label">Заметки и ИИ</p>
-              <span class="muted">до 30 последних</span>
-            </div>
-            <!-- Аддон ИИ: показывается вместо тумблера, когда ai_active=false (CONTRACT §25). -->
-            <div id="ai-addon" class="ai-addon" hidden>
-              <p id="ai-addon-title" class="ai-addon__title">ИИ-разбор — +100 ₽/мес</p>
-              <p class="ai-addon__text muted">Разбор заметок и отчётов ИИ. Аддон к подписке Vita Ratio.</p>
-              <button type="button" id="ai-addon-btn" class="btn btn--accent btn--wide">Подключить ИИ</button>
-              <p id="ai-addon-note" class="ai-addon__note" hidden></p>
-            </div>
-
-            <button type="button" id="ai-toggle" class="ai-toggle" role="switch" aria-checked="false"
-                    aria-describedby="ai-toggle-hint">
-              <span class="ai-toggle__track" aria-hidden="true"><span class="ai-toggle__thumb"></span></span>
-              <span id="ai-toggle-label" class="ai-toggle__label">Включить ИИ</span>
-            </button>
-            <p id="ai-toggle-hint" class="ai-toggle__hint" hidden>ИИ-разбор заметок выключен</p>
-            <p id="ai-active-until" class="ai-toggle__active" hidden></p>
-
-            <form id="note-form" class="form form--inline note-form" novalidate>
-              <div class="field">
-                <label for="note-text">Новая заметка</label>
-                <textarea id="note-text" maxlength="2000" rows="3"
-                          placeholder="Что съел, как спал, как прошла тренировка…"></textarea>
-              </div>
-              <button type="submit" id="note-submit" class="btn btn--accent btn--wide">Сохранить заметку</button>
-            </form>
-
-            <p id="notes-ai-off" class="note-flag" hidden>ИИ выключен</p>
-            <ul id="notes-list" class="notes-list"></ul>
-            <p id="notes-empty" class="empty" hidden>Заметок пока нет — добавь первую.</p>
-          </article>
-
-          <!-- Статус подписки под карточкой «Заметки и ИИ» (CONTRACT §25). -->
+          <!-- Заметки и чат с ИИ вынесены на отдельный экран «ИИ» (v6). -->
           <p id="subscription-status" class="subscription-status" hidden></p>
 
           <article class="card" aria-label="Профиль и цели">
@@ -814,6 +779,50 @@
           </article>
         </div>
       </section>
+
+      <!-- ==================== ИИ ==================== -->
+      <section id="screen-ai" class="screen" data-screen="ai" aria-labelledby="ai-title">
+        <header class="screen-head ai-head">
+          <div>
+            <p class="eyebrow">Коуч</p>
+            <h1 id="ai-title" class="title title--sm">ИИ-коуч</h1>
+          </div>
+          <p id="ai-screen-status" class="ai-screen-status" aria-live="polite">ИИ +100 ₽/мес</p>
+        </header>
+
+        <div id="ai-content" class="screen-content ai-content">
+          <!-- Paywall ИИ-аддона: показывается вместо поля ввода, если ai_active=false (CONTRACT §25). -->
+          <article id="ai-paywall" class="card ai-paywall" aria-label="Подключение ИИ" hidden>
+            <div class="card__head">
+              <p class="card__label">ИИ-разбор</p>
+              <span id="ai-paywall-price" class="ai-paywall__price">+100 ₽/мес</span>
+            </div>
+            <p id="ai-paywall-text" class="muted">ИИ-коуч разбирает заметки и подсказывает, что поправить в питании, сне и тренировках.</p>
+            <button type="button" id="ai-subscribe-btn" class="btn btn--accent btn--wide">Подключить ИИ · +100 ₽/мес</button>
+            <p id="ai-paywall-note" class="ai-paywall__note" hidden></p>
+          </article>
+
+          <!-- Плашка «ИИ выключен» (ai_active=true, но ai_enabled=false). -->
+          <article id="ai-off-banner" class="ai-off-banner" aria-live="polite" hidden>
+            <p id="ai-off-banner-text" class="ai-off-banner__text">ИИ выключен</p>
+            <button type="button" id="ai-enable-btn" class="btn btn--ghost ai-off-banner__btn">Включить ИИ</button>
+          </article>
+
+          <div class="ai-chat">
+            <ul id="ai-chat-list" class="ai-chat-list" aria-live="polite"></ul>
+            <p id="ai-chat-empty" class="empty">Пока пусто — напиши первую заметку, и ИИ-коуч разберёт её.</p>
+            <p id="ai-typing" class="ai-typing" hidden>🤖 ИИ печатает…</p>
+          </div>
+        </div>
+
+        <!-- Ввод закреплён снизу над таб-баром, отступ учитывает safe-area. -->
+        <form id="ai-composer" class="ai-composer" novalidate hidden>
+          <label class="visually-hidden" for="ai-input">Сообщение ИИ-коучу</label>
+          <textarea id="ai-input" maxlength="2000" rows="1"
+                    placeholder="Сообщение ИИ-коучу…"></textarea>
+          <button type="submit" id="ai-send" class="btn btn--accent ai-send">Отправить</button>
+        </form>
+      </section>
     </main>
 
     <nav class="tabbar" aria-label="Основная навигация">
@@ -836,6 +845,10 @@
       <button type="button" class="tab" data-screen="progress" aria-label="Прогресс">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V9M10 20V5M16 20v-7M22 20H2"/></svg>
         <span>Прогресс</span>
+      </button>
+      <button type="button" id="tab-ai" class="tab" data-screen="ai" aria-label="ИИ">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM18.5 15.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z"/></svg>
+        <span>ИИ</span>
       </button>
     </nav>
   </div>
