@@ -133,3 +133,14 @@ CREATE TABLE IF NOT EXISTS weekly_checkins (
     created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE (user_id, week_start)
 );
+
+-- Заметки пользователя с ответом ИИ-коуча (команда /note в боте)
+CREATE TABLE IF NOT EXISTS notes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date       TEXT    NOT NULL,
+    text       TEXT    NOT NULL,
+    ai_text    TEXT    NOT NULL DEFAULT '',
+    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_notes_user_date ON notes(user_id, date);

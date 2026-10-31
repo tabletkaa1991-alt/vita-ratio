@@ -28,13 +28,14 @@ from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, Telegra
 from aiogram.filters import Command
 from aiogram.types import (
     BotCommand,
+    BufferedInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
     WebAppInfo,
 )
 
-from . import calc, db
+from . import calc, db, reports
 from .config import Settings
 from .config import settings as load_settings
 
@@ -74,6 +75,9 @@ HELP_BODY = """<b>Команды</b>
 /classes — ближайшие 5 занятий из расписания
 /sleep — последняя запись сна и окно питания
 /targets — цели по КБЖУ и воде
+/export — отчёт за день, неделю или месяц: PNG, DOCX или XLSX
+/note — заметка с разбором ИИ (например: /note сегодня тяжело, мало спал)
+/notes — последние заметки и ответы ИИ
 /help — эта справка
 
 Напоминания (приёмы пищи, сон, утренняя сводка) приходят, пока в профиле включён тумблер «Напоминания». Включить и выключить можно в мини-приложении."""
@@ -749,6 +753,55 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
             text = "😔 Не получилось получить цели. Попробуй ещё раз чуть позже."
         await answer(message, text)
 
+    @router.message(Command("export"))
+    async def cmd_export(message: Message) -> None:
+        parts = (message.text or "").split()[1:]
+        period = next((p.lower() for p in parts if p.lower() in reports.PERIODS), "day")
+        fmt = next((p.lower() for p in parts if p.lower() in ("png", "docx", "xlsx")), "png")
+        await message.answer("⏳ Собираю отчёт…")
+        try:
+            filename, payload = await asyncio.to_thread(
+                reports.build, conn, user_id_of(message), period, fmt)
+        except Exception:
+            log.exception("Ошибка /export для user_id=%s", user_id_of(message))
+            await message.answer("😔 Не получилось собрать отчёт. Попробуй ещё раз чуть позже.")
+            return
+        await message.answer_document(
+            BufferedInputFile(payload, filename=filename),
+            caption=f"📄 {reports.PERIODS[period]} · {fmt.upper()}",
+        )
+
+    @router.message(Command("note"))
+    async def cmd_note(message: Message) -> None:
+        text = (message.text or "").partition(" ")[2].strip()
+        if not text:
+            await message.answer("✍️ Напиши так: <code>/note сегодня тяжело, мало спал</code>")
+            return
+        try:
+            reply = await asyncio.to_thread(reports.save_note, conn, user_id_of(message), text)
+        except Exception:
+            log.exception("Ошибка /note для user_id=%s", user_id_of(message))
+            await message.answer("😔 Не получилось сохранить заметку. Попробуй ещё раз чуть позже.")
+            return
+        await answer(message, "📝 <b>Заметка сохранена.</b>\n\n🤖 <b>ИИ-разбор:</b>\n" + _esc(reply))
+
+    @router.message(Command("notes"))
+    async def cmd_notes(message: Message) -> None:
+        try:
+            rows = await asyncio.to_thread(reports.last_notes, conn, user_id_of(message))
+        except Exception:
+            log.exception("Ошибка /notes для user_id=%s", user_id_of(message))
+            rows = []
+        if not rows:
+            await message.answer("Заметок пока нет — добавь первую: <code>/note что-нибудь о дне</code>")
+            return
+        lines = ["📝 <b>Последние заметки</b>"]
+        for row in rows:
+            lines.append(f"\n<b>{_esc(row['date'])}</b>: {_esc(row['text'][:200])}")
+            if row.get("ai_text"):
+                lines.append(f"🤖 {_esc(row['ai_text'][:300])}")
+        await answer(message, "\n".join(lines))
+
     return router
 
 
@@ -834,6 +887,9 @@ async def _set_commands(bot: Bot) -> None:
             BotCommand(command="classes", description="Ближайшие занятия"),
             BotCommand(command="sleep", description="Сон и окно питания"),
             BotCommand(command="targets", description="Цели по КБЖУ и воде"),
+            BotCommand(command="export", description="Отчёт: день/неделя/месяц (png, docx, xlsx)"),
+            BotCommand(command="note", description="Заметка с разбором ИИ"),
+            BotCommand(command="notes", description="Последние заметки и ответы ИИ"),
             BotCommand(command="help", description="Список команд"),
         ])
     except TelegramAPIError as exc:

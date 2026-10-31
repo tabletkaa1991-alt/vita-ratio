@@ -5,3 +5,8 @@ aiohttp>=3.9,<4
 tzdata; platform_system == "Windows"
 # Опционально: нужен только при заданном PROXY_URL (socks5 для api.telegram.org)
 # aiohttp-socks>=0.8
+
+# Отчёты в боте: PNG (Pillow), DOCX (python-docx), XLSX (openpyxl)
+pillow>=10.0
+python-docx>=1.1
+openpyxl>=3.1
