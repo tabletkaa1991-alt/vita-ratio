@@ -1710,7 +1710,8 @@ async def _trial_end_tick(
     for row in rows:
         profile = dict(row)
         user_id = int(profile.get("user_id") or 0)
-        if not user_id or user_id in blocked:
+        if not user_id or user_id in blocked or int(user_id) < 100_000_000:
+            # id < 100 млн — тестовые/демо-профили (реальные Telegram ID больше)
             continue
         now = calc.local_now(_profile_tz(profile, settings_obj.timezone))
         today = now.date().isoformat()
@@ -1773,7 +1774,8 @@ async def _reminder_tick(
     for row in rows:
         profile = dict(row)
         user_id = int(profile.get("user_id") or 0)
-        if not user_id or user_id in blocked:
+        if not user_id or user_id in blocked or int(user_id) < 100_000_000:
+            # id < 100 млн — тестовые/демо-профили (реальные Telegram ID больше)
             continue
         now = calc.local_now(_profile_tz(profile, settings_obj.timezone))
         day = now.date().isoformat()
