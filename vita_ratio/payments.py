@@ -34,7 +34,9 @@ def provided(settings: Settings) -> bool:
     if settings.pay_provider == "yookassa":
         return bool(settings.yookassa_shop_id and settings.yookassa_secret)
     if settings.pay_provider == "robokassa":
-        return bool(settings.robokassa_login and settings.robokassa_password1)
+        password1 = settings.robokassa_test_password1 if settings.robokassa_test else settings.robokassa_password1
+        password2 = settings.robokassa_test_password2 if settings.robokassa_test else settings.robokassa_password2
+        return bool(settings.robokassa_login and password1 and password2)
     return False
 
 
@@ -99,18 +101,31 @@ def verify_yookassa(settings: Settings, payment_id: str) -> dict | None:
             "charge_id": payment.get("id", ""), "amount": payment.get("amount", {}).get("value", "")}
 
 
+def _robokassa_password1(settings: Settings) -> str:
+    if settings.robokassa_test and settings.robokassa_test_password1:
+        return settings.robokassa_test_password1
+    return settings.robokassa_password1
+
+
+def _robokassa_password2(settings: Settings) -> str:
+    if settings.robokassa_test and settings.robokassa_test_password2:
+        return settings.robokassa_test_password2
+    return settings.robokassa_password2
+
+
 def robokassa_url(settings: Settings, user_id: int, kind: str, invoice_id: int) -> dict:
     """Подписанная ссылка Robokassa (ResultURL/вебхук — verify_robokassa)."""
     amount = rub_price(settings, kind)
     signature = hashlib.md5(
         f"{settings.robokassa_login}:{amount:.2f}:{invoice_id}:".encode("utf-8")
-        + settings.robokassa_password1.encode("utf-8")
+        + _robokassa_password1(settings).encode("utf-8")
     ).hexdigest()
+    is_test = "1" if settings.robokassa_test else "0"
     query = (
         f"?MerchantLogin={urllib.parse.quote(settings.robokassa_login)}"
         f"&OutSum={amount:.2f}&InvId={invoice_id}"
         f"&Description={urllib.parse.quote('Vita Ratio подписка')}"
-        f"&SignatureValue={signature}&IsTest=0"
+        f"&SignatureValue={signature}&IsTest={is_test}"
     )
     return {"provider": "robokassa", "external_id": str(invoice_id),
             "invoice_url": ROBOKASSA_URL + query, "price_rub": amount}
@@ -120,7 +135,7 @@ def verify_robokassa(settings: Settings, out_sum: str, inv_id: str, signature: s
     """Проверяет подпись ResultURL → возвращает invoice_id (StrId) или None."""
     try:
         expected = hashlib.md5(
-            f"{out_sum}:{inv_id}:".encode("utf-8") + settings.robokassa_password2.encode("utf-8")
+            f"{out_sum}:{inv_id}:".encode("utf-8") + _robokassa_password2(settings).encode("utf-8")
         ).hexdigest()
     except Exception:
         return None

@@ -64,6 +64,10 @@ class Settings:
     robokassa_login: str = ""
     robokassa_password1: str = ""
     robokassa_password2: str = ""
+    # Тестовый режим Robokassa: отдельные пароли + IsTest=1 в ссылке оплаты.
+    robokassa_test: bool = False
+    robokassa_test_password1: str = ""
+    robokassa_test_password2: str = ""
     # Бесплатный доступ (без подписки и без оплаты ИИ): Telegram ID через запятую
     # и/или username без @ через запятую (регистр не важен).
     free_access_ids: str = ""
@@ -141,6 +145,9 @@ def settings(from_env: bool = True) -> Settings:
         robokassa_login=get("ROBOKASSA_LOGIN", "").strip(),
         robokassa_password1=get("ROBOKASSA_PASSWORD1", "").strip(),
         robokassa_password2=get("ROBOKASSA_PASSWORD2", "").strip(),
+        robokassa_test=get("ROBOKASSA_TEST", "0").strip().lower() in {"1", "true", "yes", "on"},
+        robokassa_test_password1=get("ROBOKASSA_TEST_PASSWORD1", "").strip(),
+        robokassa_test_password2=get("ROBOKASSA_TEST_PASSWORD2", "").strip(),
         free_access_ids=get("FREE_ACCESS_IDS", "").strip(),
         free_access_usernames=get("FREE_ACCESS_USERNAMES", "").strip(),
         data_repo=get("DATA_REPO", "").strip(),
