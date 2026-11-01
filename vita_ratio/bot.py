@@ -634,13 +634,19 @@ def format_admin_users(
         today, getattr(settings_obj, "trial_days", 0)
     )
     for number, row in enumerate(rows, start=offset + 1):
-        parts = [f"{number}) <code>{_esc(_dget(row, 'user_id', ''))}</code>"]
+        raw_id = str(_dget(row, "user_id", "") or "")
+        user_id = _esc(raw_id)
+        parts = [f"{number}) <code>{user_id}</code>"]
         username = str(_dget(row, "username", "") or "").strip().lstrip("@")
         if username:
             parts.append(f"@{_esc(username)}")
+        else:
+            parts.append("без @username")
         first_name = str(_dget(row, "first_name", "") or "").strip()
         if first_name:
-            parts.append(_esc(first_name))
+            parts.append(f'<a href="tg://user?id={user_id}">{_esc(first_name)}</a>')
+        else:
+            parts.append(f'<a href="tg://user?id={user_id}">профиль</a>')
         status = _admin_user_status(
             row, settings_obj, conn, today, trial_until
         )
