@@ -1,12 +1,17 @@
 """Настройки приложения: .env + переменные окружения (без внешних зависимостей)."""
 from __future__ import annotations
 
+import base64
+import json
+import logging
 import os
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ENV_FILE = ROOT / ".env"
+log = logging.getLogger("vita_ratio.config")
 
 
 def load_env_file(path: Path | None = None) -> dict[str, str]:
@@ -88,13 +93,46 @@ class Settings:
         return self.app_env.strip().lower() not in {"prod", "production"}
 
 
+def _private_overrides() -> dict[str, str]:
+    """Настройки из приватного data-репозитория: ``config/overrides.json``.
+
+    Позволяет менять платёжные ключи/режимы без Render API: файл лежит рядом
+    с бэкапом БД, доступ — по уже заданным ``DATA_REPO``/``DATA_TOKEN``.
+    Любая ошибка сети/JSON тихо игнорируется (приложение работает на env).
+    """
+    repo = os.environ.get("DATA_REPO", "").strip()
+    token = os.environ.get("DATA_TOKEN", "").strip()
+    branch = os.environ.get("DATA_BRANCH", "main").strip() or "main"
+    if not repo or not token:
+        return {}
+    url = f"https://api.github.com/repos/{repo}/contents/config/overrides.json?ref={branch}"
+    request = urllib.request.Request(url, headers={
+        "Authorization": "Bearer " + token,
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "vita-config",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read())
+        raw = base64.b64decode(payload.get("content") or "").decode("utf-8")
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return {str(key): str(value) for key, value in data.items()}
+    except Exception as exc:  # noqa: BLE001 — приватные оверрайды не критичны
+        log.warning("config: не удалось прочитать приватные настройки (%s)", type(exc).__name__)
+    return {}
+
+
 def settings(from_env: bool = True) -> Settings:
-    """Читает .env, затем переменные окружения (env важнее)."""
+    """Читает .env, приватные overrides и переменные окружения (env важнее)."""
     file_values = load_env_file() if from_env else {}
+    overrides = _private_overrides()
 
     def get(name: str, default: str = "") -> str:
         if from_env and os.environ.get(name):
             return os.environ[name]
+        if name in overrides:
+            return overrides[name]
         return file_values.get(name, default)
 
     db_path = Path(get("DB_PATH", "data/vita.db"))
