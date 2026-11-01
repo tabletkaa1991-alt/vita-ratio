@@ -966,6 +966,41 @@
     node.classList.toggle('subscription-status--trial', sub.active && subscriptionIsTrial(sub));
   }
 
+  /* Кнопки оплаты в карточке «Подписка» (#screen-settings) видны всегда:
+     при активной подписке/триале/бесплатном доступе они становятся продлением,
+     поэтому оплату можно проверить в любом состоянии аккаунта. Цены в рублях
+     и Stars берём из /api/subscription (фолбэк — SUBSCRIPTION_DEFAULTS). */
+  function renderSettingsBilling(sub) {
+    var data = sub || subscriptionPayload();
+    var rub = data ? data.base_price_rub : SUBSCRIPTION_DEFAULTS.base_price_rub;
+    var stars = data ? data.base_price_stars : SUBSCRIPTION_DEFAULTS.base_price_stars;
+    var aiRub = data ? data.ai_price_rub : SUBSCRIPTION_DEFAULTS.ai_price_rub;
+    var aiStars = data ? data.ai_price_stars : SUBSCRIPTION_DEFAULTS.ai_price_stars;
+    var baseActive = !!(data && data.active === true);
+    var aiActive = !!(data && data.ai_active === true);
+    var subButton = byId('sub-buy-btn');
+    var subStarsNode = byId('sub-buy-stars');
+    var aiButton = byId('ai-buy-btn');
+    var aiStarsNode = byId('ai-buy-stars');
+
+    if (subButton) {
+      subButton.textContent = (baseActive ? 'Продлить подписку ' : 'Оплатить подписку ') +
+        fmtInt(rub) + ' ₽/мес';
+    }
+    if (subStarsNode) {
+      subStarsNode.textContent = '≈' + fmtInt(stars) + ' Stars';
+      subStarsNode.hidden = !(stars > 0);
+    }
+    if (aiButton) {
+      aiButton.textContent = (aiActive ? 'Продлить ИИ · +' : 'Подключить ИИ · +') +
+        fmtInt(aiRub) + ' ₽/мес';
+    }
+    if (aiStarsNode) {
+      aiStarsNode.textContent = '≈' + fmtInt(aiStars) + ' Stars';
+      aiStarsNode.hidden = !(aiStars > 0);
+    }
+  }
+
   function renderSubscription() {
     var sub = subscriptionPayload();
     if (sub && sub.active === true) { state.pay.forcePaywall = false; }
@@ -974,6 +1009,8 @@
     }
     renderPaywall(sub);
     renderSubscriptionStatus(sub);
+    /* Кнопки «Оплатить/Продлить» в настройках — всегда на экране. */
+    renderSettingsBilling(sub);
     /* Тумблер ИИ-аддона на экране «Настройки» живёт на тех же данных. */
     renderAiPlan(sub);
     /* Экран ИИ сам решает, показать поле ввода или плашку +100 ₽/мес. */
@@ -1121,6 +1158,8 @@
       }
       state.aiChat.forcePaywall = false;
       renderAiPlan(subscriptionPayload());
+      /* Кнопка #ai-buy-btn сразу становится «Продлить ИИ · +100 ₽/мес». */
+      renderSettingsBilling(subscriptionPayload());
       loadSubscription({ force: true });
     }).catch(function () {
       /* Вебхук мог ещё не дойти: статус обновит ближайший GET /api/subscription. */
@@ -1165,14 +1204,21 @@
     }
   }
 
-  function payBase() {
+  /* Оплата базовой подписки: блокирующий paywall (#sub-pay-btn) и кнопка
+     в «Настройках» (#sub-buy-btn) используют один и тот же POST /api/pay/invoice
+     kind=base. opts.buttonId/noteId позволяют показать занятость и подсказку
+     со ссылкой на счёт именно в той карточке, откуда пришёл клик. */
+  function payBase(options) {
+    var opts = options || {};
     if (state.pay.baseBusy) { return; }
-    var button = byId('sub-pay-btn');
+    var buttonId = opts.buttonId || 'sub-pay-btn';
+    var noteId = opts.noteId || 'sub-pay-note';
+    var button = byId(buttonId);
     var sub = subscriptionPayload();
     var rub = sub ? sub.base_price_rub : SUBSCRIPTION_DEFAULTS.base_price_rub;
     state.pay.baseBusy = true;
     setBusy(button, true);
-    hideInvoiceHint('base');
+    hideInvoiceHint('base', noteId);
     haptic('select');
     requestInvoice('base').then(function (data) {
       state.pay.baseBusy = false;
@@ -1187,7 +1233,7 @@
         handleInvoiceStatus('base', status);
       });
       if (!opened) {
-        showInvoiceHint('base', data.invoice_url);
+        showInvoiceHint('base', data.invoice_url, noteId);
         toast('Готово: оплати ' + fmtInt(rub) + ' ₽ в Telegram');
       }
     }).catch(function (error) {
@@ -1233,10 +1279,14 @@
       haptic('error');
       var code = error && error.code;
       if (code === 'base_required') {
-        /* Аддон без base: показываем paywall базовой подписки. */
-        state.pay.forcePaywall = true;
-        renderSubscription();
-        toast('Сначала оформи подписку Vita Ratio — 250 ₽/мес.', 'error');
+        /* Аддон без base. Кнопка #ai-buy-btn из «Настроек» только показывает
+           тост (рядом есть кнопка оплаты base), а paywall экрана «ИИ» и
+           модалка из настроек по-прежнему открывают базовый paywall. */
+        if (opts.forceBasePaywall !== false) {
+          state.pay.forcePaywall = true;
+          renderSubscription();
+        }
+        toast(opts.baseRequiredToast || 'Сначала оформи подписку Vita Ratio — 250 ₽/мес.', 'error');
         return;
       }
       if (code === 'subscription_required' || code === 'http_402') { loadSubscription(); }
@@ -1298,6 +1348,7 @@
     renderProfileForm();
     renderPalette();
     renderSubscriptionStatus(subscriptionPayload());
+    renderSettingsBilling(subscriptionPayload());
     renderAiPlan(subscriptionPayload());
     loadTheme();
   }
@@ -4605,6 +4656,19 @@
     byId('ai-plan-pay-cancel').addEventListener('click', closeAiPlanPaywall);
     byId('ai-plan-paywall').addEventListener('click', function (event) {
       if (event.target === byId('ai-plan-paywall')) { closeAiPlanPaywall(); }
+    });
+
+    // Настройки: всегда видимые кнопки оплаты/продления (kind=base / kind=ai)
+    byId('sub-buy-btn').addEventListener('click', function () {
+      payBase({ buttonId: 'sub-buy-btn', noteId: 'sub-buy-note' });
+    });
+    byId('ai-buy-btn').addEventListener('click', function () {
+      payAiAddon({
+        buttonId: 'ai-buy-btn',
+        noteId: 'ai-buy-note',
+        forceBasePaywall: false,
+        baseRequiredToast: 'Сначала оформите подписку 250 ₽/мес'
+      });
     });
 
     // Онбординг

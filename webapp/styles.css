@@ -3254,6 +3254,31 @@ body.paywall-open {
   margin: 0 0 14px;
 }
 
+/* ---------- всегда видимые кнопки оплаты/продления подписки ---------- */
+
+.sub-buy {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+
+.sub-buy .btn {
+  width: 100%;
+}
+
+.sub-buy__stars {
+  margin: -4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  text-align: center;
+}
+
+.sub-buy__note {
+  margin-top: 2px;
+}
+
 /* ---------- ИИ-аддон: строка с тумблером ---------- */
 
 .ai-plan-row {

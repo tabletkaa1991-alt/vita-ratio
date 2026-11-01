@@ -833,6 +833,16 @@
               <span class="muted">Vita Ratio</span>
             </div>
             <p id="subscription-status" class="subscription-status" hidden></p>
+            <!-- Оплата видна всегда — и при активной подписке/триале/бесплатном
+                 доступе: при активной подписке кнопки работают как продление. -->
+            <div class="sub-buy" aria-label="Оплата подписки и ИИ-аддона">
+              <button type="button" id="sub-buy-btn" class="btn btn--accent btn--wide">Оплатить подписку 250 ₽/мес</button>
+              <p id="sub-buy-stars" class="sub-buy__stars">≈150 Stars</p>
+              <button type="button" id="ai-buy-btn" class="btn btn--ghost btn--wide">Подключить ИИ · +100 ₽/мес</button>
+              <p id="ai-buy-stars" class="sub-buy__stars">≈60 Stars</p>
+              <p id="sub-buy-note" class="paywall__note sub-buy__note" hidden></p>
+              <p id="ai-buy-note" class="paywall__note sub-buy__note" hidden></p>
+            </div>
             <div class="ai-plan-row">
               <div class="ai-plan-info">
                 <p class="ai-plan-title">ИИ-ассистент</p>
