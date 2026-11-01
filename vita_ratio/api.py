@@ -2340,12 +2340,58 @@ async def post_pay_robokassa_result(request: web.Request) -> web.Response:
 
 
 async def get_pay_robokassa_success(request: web.Request) -> web.Response:
-    """GET /api/pay/robokassa/success — страница «спасибо» после оплаты."""
+    """GET /api/pay/robokassa/success — возврат после оплаты + подтверждение счёта.
+
+    Robokassa передаёт сюда OutSum, InvId и SignatureValue (подпись паролем №1).
+    Если подпись валидна — активируем счёт (идемпотентно), даже когда ResultURL
+    не дошёл. Это второй канал подтверждения: браузер пользователя (VPN) доходит
+    до сервера, когда вебхук Robokassa из РФ может блокироваться.
+    """
+    settings_obj = _settings(request)
+    conn = _conn(request)
+    out_sum = str(request.query.get("OutSum") or "").strip()
+    inv_id = str(request.query.get("InvId") or "").strip()
+    signature = str(request.query.get("SignatureValue") or "").strip()
+    activated = False
+    if out_sum and inv_id and signature:
+        invoice_id = payments.verify_robokassa_success(settings_obj, out_sum, inv_id, signature)
+        if invoice_id is not None:
+            invoice = store.get_invoice_by_external(conn, str(invoice_id))
+            if invoice is not None:
+                if str(invoice.get("status") or "") == "succeeded":
+                    activated = True
+                else:
+                    try:
+                        amount = int(float(invoice.get("amount_rub") or 0))
+                    except (TypeError, ValueError):
+                        amount = 0
+                    try:
+                        _activate_provider_payment(
+                            conn,
+                            settings_obj,
+                            invoice.get("user_id"),
+                            invoice.get("kind"),
+                            f"robokassa:{invoice_id}",
+                            amount,
+                            "RUB",
+                            "robokassa",
+                        )
+                        store.mark_invoice(conn, str(invoice_id), "succeeded")
+                        activated = True
+                        log.info("robokassa success: счёт InvId=%s подтверждён", invoice_id)
+                    except Exception:  # noqa: BLE001 — покажем страницу, не 500
+                        log.exception("robokassa success: не удалось активировать InvId=%s", invoice_id)
+    title = "Оплата прошла" if activated else "Оплата не подтверждена"
+    body = (
+        "Подписка активирована. Вернитесь в приложение."
+        if activated
+        else "Не удалось подтвердить платёж. Вернитесь в приложение — статус обновится."
+    )
     return web.Response(
         text=(
             "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
-            "<title>Vita Ratio — оплата</title></head><body>"
-            "<p>Оплата прошла. Вернитесь в приложение.</p></body></html>"
+            f"<title>Vita Ratio — {title}</title></head><body>"
+            f"<p>{body}</p></body></html>"
         ),
         content_type="text/html",
         charset="utf-8",

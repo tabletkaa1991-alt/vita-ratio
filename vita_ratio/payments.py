@@ -145,3 +145,26 @@ def verify_robokassa(settings: Settings, out_sum: str, inv_id: str, signature: s
         return int(inv_id)
     except ValueError:
         return None
+
+
+def verify_robokassa_success(
+    settings: Settings, out_sum: str, inv_id: str, signature: str
+) -> int | None:
+    """Проверяет подпись SuccessURL (пароль №1) -> invoice_id или None.
+
+    SuccessURL — возврат браузера после оплаты; подпись там считается с паролем №1.
+    Второй канал подтверждения, если ResultURL-вебхук не дошёл (домены Render в РФ
+    могут блокироваться, а браузер пользователя с VPN до сервера доходит).
+    """
+    try:
+        expected = hashlib.md5(
+            f"{out_sum}:{inv_id}:".encode("utf-8") + _robokassa_password1(settings).encode("utf-8")
+        ).hexdigest()
+    except Exception:
+        return None
+    if signature.lower() != expected.lower():
+        return None
+    try:
+        return int(inv_id)
+    except ValueError:
+        return None
