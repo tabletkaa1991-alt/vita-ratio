@@ -1053,6 +1053,11 @@ async def health(request: web.Request) -> web.Response:
         "version": __version__,
         "env": settings.app_env,
         "ai": {"provider": provider, "model": model, "key_set": bool(os.environ.get("AI_API_KEY"))},
+        "pay": {
+            "provider": settings.pay_provider,
+            "configured": payments.provided(settings),
+            "test": bool(settings.robokassa_test),
+        },
     })
 
 
