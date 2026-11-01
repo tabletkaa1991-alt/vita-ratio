@@ -30,6 +30,7 @@ from aiogram.filters import Command
 from aiogram.types import (
     BotCommand,
     BufferedInputFile,
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -91,7 +92,8 @@ HELP_BODY = """<b>Команды</b>
 /whoami — твой Telegram ID и username (нужно для бесплатного доступа)
 /help — эта справка
 
-<b>Владельцу бота</b>
+<b>Владельцу бота (админ)</b>
+/users — админ: список пользователей и статусы подписки (алиас /stats)
 /grant 123456789 — выдать бесплатный доступ по ID или /grant @username
 /revoke 123456789 — снять бесплатный доступ
 /free_list — кто в бесплатном доступе (БД и env)
@@ -107,7 +109,7 @@ PAYWALL_TEXT = (
 #: Команды, которые работают всегда (вне платного гейта).
 FREE_COMMANDS = frozenset({
     "/start", "/menu", "/app", "/help", "/subscription", "/whoami",
-    "/grant", "/revoke", "/free_list", "/ask",
+    "/grant", "/revoke", "/free_list", "/users", "/stats", "/ask",
 })
 #: Команды, которым нужна активная base-подписка.
 GATED_COMMANDS = frozenset({
@@ -125,6 +127,13 @@ MENU_COMMANDS = (
     "/subscription — подписка и оплата",
     "/whoami — мой Telegram ID",
     "/help — полная справка",
+)
+#: Команды владельца в /menu (видны только администратору).
+MENU_ADMIN_COMMANDS = (
+    "/users — пользователи и статусы подписки",
+    "/grant — выдать бесплатный доступ",
+    "/revoke — снять бесплатный доступ",
+    "/free_list — бесплатный доступ (БД и env)",
 )
 
 
@@ -366,16 +375,23 @@ def _command_args(message: Any) -> str:
     return parts[1].strip() if len(parts) > 1 else ""
 
 
-def is_admin(settings_obj: Settings, message: Any) -> bool:
-    """True, если команду отправил владелец бота (``settings.admin_id``)."""
+def _is_admin_id(settings_obj: Settings, user_id: Any) -> bool:
+    """True, если Telegram ID принадлежит администратору (``settings.admin_id``)."""
     admin_id = getattr(settings_obj, "admin_id", None)
-    sender = _sender(message)
-    if not admin_id or sender is None:
+    if not admin_id or user_id is None:
         return False
     try:
-        return int(admin_id) == int(getattr(sender, "id", 0) or 0)
+        return int(admin_id) == int(user_id)
     except (TypeError, ValueError):
         return False
+
+
+def is_admin(settings_obj: Settings, message: Any) -> bool:
+    """True, если команду отправил владелец бота (``settings.admin_id``)."""
+    sender = _sender(message)
+    if sender is None:
+        return False
+    return _is_admin_id(settings_obj, getattr(sender, "id", None))
 
 
 def format_whoami(message: Any) -> str:
@@ -472,6 +488,215 @@ def command_free_list(settings_obj: Settings, conn: sqlite3.Connection, message:
     return format_free_list(settings_obj, access.list_free(conn))
 
 
+# --- админ-обзор /users (алиас /stats) -----------------------------------------
+
+#: Ответ на /users от любого, кроме администратора.
+ADMIN_USERS_DENIED_TEXT = "Команда только для администратора"
+#: Сколько пользователей на страницу /users.
+ADMIN_USERS_PAGE_SIZE = 10
+#: Префикс callback_data пагинации: ``admin_users:page:N``.
+ADMIN_USERS_CALLBACK_PREFIX = "admin_users:page:"
+
+
+def admin_users_page_arg(message: Any) -> int:
+    """Номер страницы из аргумента ``/users 2``; пусто/мусор -> 1."""
+    try:
+        page = int(_command_args(message))
+    except (TypeError, ValueError):
+        return 1
+    return max(page, 1)
+
+
+def admin_users_callback_page(data: Any) -> int:
+    """Номер страницы из callback_data ``admin_users:page:N``; мусор -> 1."""
+    tail = str(data or "").rsplit(":", 1)[-1]
+    try:
+        return max(int(tail), 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _trial_until(today: str, trial_days: Any) -> date_cls | None:
+    """Дата ``today + trial_days`` для распознавания триала (или None)."""
+    try:
+        days = int(trial_days or 0)
+        base = date_cls.fromisoformat(str(today)[:10])
+    except (TypeError, ValueError):
+        return None
+    if days <= 0:
+        return None
+    return base + timedelta(days=days)
+
+
+def _admin_user_status(
+    row: Any,
+    settings_obj: Settings,
+    conn: sqlite3.Connection | None,
+    today: str,
+    trial_until: date_cls | None = None,
+) -> str:
+    """Статус подписки одной строки /users для HTML-вывода.
+
+    ``♾ бесплатный`` (whitelist, включая env), ``🎁 триал до DD.MM`` (активная дата
+    ровно ``today + trial_days`` и ни одного платежа), ``✅ до DD.MM.YYYY``
+    с суффиксом ``(+ИИ до DD.MM)``, ``❌ истекла DD.MM.YYYY`` или ``❌ нет подписки``.
+    """
+    user_id = _dget(row, "user_id", None)
+    username = _dget(row, "username", None)
+    if access.is_free(
+        settings_obj, user_id=user_id, username=username, conn=conn
+    ):
+        return "♾ бесплатный"
+    current = _day(today)
+    until = _day(_dget(row, "sub_until", None))
+    if until is not None and current is not None and until >= current:
+        try:
+            payments = int(_dget(row, "payments", 0) or 0)
+        except (TypeError, ValueError):
+            payments = 0
+        if trial_until is not None and until == trial_until and payments == 0:
+            return f"🎁 триал до {_dotted(until)}"
+        status = f"✅ до {_dotted(until, with_year=True)}"
+        ai_until = _day(_dget(row, "ai_until", None))
+        if ai_until is not None and current is not None and ai_until >= current:
+            status += f" (+ИИ до {_dotted(ai_until)})"
+        return status
+    if until is not None:
+        return f"❌ истекла {_dotted(until, with_year=True)}"
+    return "❌ нет подписки"
+
+
+def _rub_text(value: Any) -> str:
+    """Сумма в рублях без лишних нулей: 250 -> ``250``, 250.5 -> ``250.50``."""
+    try:
+        amount = float(value or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    if amount == int(amount):
+        return str(int(amount))
+    return f"{amount:.2f}"
+
+
+def format_admin_users(
+    overview: dict,
+    settings_obj: Settings,
+    conn: sqlite3.Connection | None,
+    today: str,
+) -> str:
+    """HTML-текст /users: итоги, платежи, список пользователей и футер страницы."""
+    totals = overview.get("totals") or {}
+    rows = overview.get("rows") or []
+    page = int(overview.get("page") or 1)
+    pages = int(overview.get("pages") or 1)
+    offset = int(overview.get("offset") or 0)
+    try:
+        base_price = int(getattr(settings_obj, "base_price_rub", 250) or 250)
+        stars_price = int(getattr(settings_obj, "base_price_stars", 150) or 150)
+    except (TypeError, ValueError):
+        base_price, stars_price = 250, 150
+
+    lines = [
+        "👥 <b>Пользователи</b>",
+        "",
+        (
+            f"Всего: {int(totals.get('users') or 0)} · "
+            f"активная подписка: {int(totals.get('active') or 0)} · "
+            f"истекла: {int(totals.get('expired') or 0)} · "
+            f"ИИ активен: {int(totals.get('ai_active') or 0)}"
+        ),
+    ]
+
+    free_env = len(access.free_ids(settings_obj)) + len(access.free_usernames(settings_obj))
+    free_total = int(totals.get("free") or 0) + free_env
+    if free_total:
+        lines.append(f"♾ Бесплатный доступ: {free_total}")
+
+    revenue = totals.get("revenue") or {}
+    rub_count = int(revenue.get("rub_count") or 0)
+    xtr_count = int(revenue.get("xtr_count") or 0)
+    if rub_count:
+        lines.append(
+            f"💰 Платежи: {rub_count} × {base_price} ₽ = "
+            f"{_rub_text(revenue.get('rub'))} ₽"
+        )
+    if xtr_count:
+        lines.append(
+            f"⭐ XTR: {xtr_count} × {stars_price} = "
+            f"{_rub_text(revenue.get('xtr'))} Stars"
+        )
+    if not rub_count and not xtr_count:
+        lines.append("💰 Платежи: пока нет")
+
+    lines.append("")
+    if not rows:
+        lines.append("Пока никто не зарегистрирован.")
+    trial_until = _trial_until(
+        today, getattr(settings_obj, "trial_days", 0)
+    )
+    for number, row in enumerate(rows, start=offset + 1):
+        parts = [f"{number}) <code>{_esc(_dget(row, 'user_id', ''))}</code>"]
+        username = str(_dget(row, "username", "") or "").strip().lstrip("@")
+        if username:
+            parts.append(f"@{_esc(username)}")
+        first_name = str(_dget(row, "first_name", "") or "").strip()
+        if first_name:
+            parts.append(_esc(first_name))
+        status = _admin_user_status(
+            row, settings_obj, conn, today, trial_until
+        )
+        lines.append(" · ".join(parts) + f" — {status}")
+
+    lines.extend(["", f"Страница {page}/{pages}"])
+    return "\n".join(lines)
+
+
+def admin_users_markup(overview: dict) -> InlineKeyboardMarkup | None:
+    """Inline-кнопки ⬅️/➡️ для пагинации; на краях кнопка скрывается."""
+    page = int(overview.get("page") or 1)
+    pages = int(overview.get("pages") or 1)
+    buttons: list[InlineKeyboardButton] = []
+    if page > 1:
+        buttons.append(
+            InlineKeyboardButton(
+                text="⬅️",
+                callback_data=f"{ADMIN_USERS_CALLBACK_PREFIX}{page - 1}",
+            )
+        )
+    if page < pages:
+        buttons.append(
+            InlineKeyboardButton(
+                text="➡️",
+                callback_data=f"{ADMIN_USERS_CALLBACK_PREFIX}{page + 1}",
+            )
+        )
+    if not buttons:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+
+def build_admin_users(
+    settings_obj: Settings,
+    conn: sqlite3.Connection,
+    page: int = 1,
+    today: str | None = None,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Текст и клавиатура /users для страницы ``page`` (SQLite читает store)."""
+    day = today or calc.local_today(
+        getattr(settings_obj, "timezone", None) or DEFAULT_TIMEZONE
+    )
+    page = max(int(page or 1), 1)
+    overview = store.admin_users_overview(
+        conn,
+        day,
+        offset=(page - 1) * ADMIN_USERS_PAGE_SIZE,
+        limit=ADMIN_USERS_PAGE_SIZE,
+    )
+    return (
+        format_admin_users(overview, settings_obj, conn, day),
+        admin_users_markup(overview),
+    )
+
+
 def format_subscription(
     profile: Any,
     settings_obj: Settings,
@@ -537,11 +762,13 @@ def format_menu(
     today: str,
     timer: str | None = None,
     free: bool = False,
+    admin: bool = False,
 ) -> str:
     """Текст /menu: срок доступа, живой таймер периода и краткий список команд.
 
     ``timer`` — результат :func:`format_trial_timer` (пересчитывается на каждый
-    вызов /menu, поэтому счётчик в сообщении всегда актуальный).
+    вызов /menu, поэтому счётчик в сообщении всегда актуальный). ``admin=True``
+    добавляет блок команд владельца (/users, /grant, /revoke, /free_list).
     """
     lines = ["☰ <b>Меню Vita Ratio</b>", ""]
     if free:
@@ -557,6 +784,8 @@ def format_menu(
     if timer:
         lines.append(timer)
     lines.extend(["", "<b>Команды</b>", *MENU_COMMANDS])
+    if admin:
+        lines.extend(["", "<b>Админ</b>", *MENU_ADMIN_COMMANDS])
     if not profile:
         lines.extend([
             "",
@@ -1254,7 +1483,8 @@ def build_menu(
         timer = format_trial_timer(
             profile, settings_obj, day, conn=conn, username=username
         )
-    return format_menu(profile, settings_obj, day, timer=timer, free=free)
+    admin = _is_admin_id(settings_obj, user_id)
+    return format_menu(profile, settings_obj, day, timer=timer, free=free, admin=admin)
 
 
 def build_plan(conn: sqlite3.Connection, user_id: int, default_tz: str = DEFAULT_TIMEZONE) -> str:
@@ -1465,6 +1695,48 @@ def build_router(settings_obj: Settings, conn: sqlite3.Connection) -> Router:
     async def cmd_free_list(message: Message) -> None:
         """Владелец: список бесплатного доступа из БД и env."""
         await answer(message, command_free_list(settings_obj, conn, message))
+
+    @router.message(Command("users", "stats"))
+    async def cmd_users(message: Message) -> None:
+        """Админ: пользователи и статусы подписки; ``/users 2`` — сразу страница 2."""
+        if not is_admin(settings_obj, message):
+            await answer(message, ADMIN_USERS_DENIED_TEXT)
+            return
+        page = admin_users_page_arg(message)
+        try:
+            text, markup = build_admin_users(settings_obj, conn, page)
+        except sqlite3.Error:
+            log.exception("Ошибка /users для user_id=%s", user_id_of(message))
+            await answer(
+                message,
+                "😔 Не получилось показать пользователей. Попробуй ещё раз чуть позже.",
+            )
+            return
+        await answer(message, text, markup)
+
+    @router.callback_query(F.data.startswith(ADMIN_USERS_CALLBACK_PREFIX))
+    async def on_admin_users_page(callback: CallbackQuery) -> None:
+        """Пагинация /users: правит сообщение на месте (только для админа)."""
+        sender = getattr(callback, "from_user", None)
+        if not _is_admin_id(settings_obj, getattr(sender, "id", None)):
+            await callback.answer(ADMIN_USERS_DENIED_TEXT, show_alert=True)
+            return
+        await callback.answer()
+        message = getattr(callback, "message", None)
+        if message is None:
+            return
+        page = admin_users_callback_page(getattr(callback, "data", ""))
+        try:
+            text, markup = build_admin_users(settings_obj, conn, page)
+            await message.edit_text(
+                text, parse_mode=ParseMode.HTML, reply_markup=markup
+            )
+        except sqlite3.Error:
+            log.exception("Ошибка пагинации /users (страница %s)", page)
+            with contextlib.suppress(Exception):
+                await message.answer("😔 Не получилось показать страницу.")
+        except TelegramAPIError as exc:
+            log.warning("Не удалось обновить сообщение /users: %s", exc)
 
     @router.message(Command("start"))
     async def cmd_start(message: Message) -> None:

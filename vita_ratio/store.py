@@ -1010,6 +1010,167 @@ def add_payment(
     return cursor.rowcount > 0
 
 
+# --- админ-обзор пользователей (/users) ----------------------------------------
+
+#: Условие «uid/username есть в whitelist бесплатного доступа» (free_access).
+_FREE_MATCH_SQL = (
+    "EXISTS (SELECT 1 FROM free_access f WHERE f.value = CAST(u.id AS TEXT) "
+    "OR (u.username IS NOT NULL AND u.username <> '' AND f.value = lower(u.username)))"
+)
+
+#: Условие активной даты подписки/ИИ: дата хранится ISO, сравнение по первым 10.
+_DATE_ACTIVE_SQL = "({column} IS NOT NULL AND substr({column}, 1, 10) >= ?)"
+
+
+def _overview_count(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> int:
+    """Целый счётчик для админ-обзора; ошибка схемы (старая база) -> 0."""
+    try:
+        row = conn.execute(sql, params).fetchone()
+    except sqlite3.Error:
+        log.exception("admin_users_overview: не удалось выполнить счётчик")
+        return 0
+    if row is None:
+        return 0
+    try:
+        return int(row[0] or 0)
+    except (TypeError, ValueError, IndexError, KeyError):
+        return 0
+
+
+def admin_users_overview(
+    conn: sqlite3.Connection,
+    today: str,
+    offset: int = 0,
+    limit: int = 10,
+) -> dict:
+    """Сводка для админ-команды ``/users``: итоги, страница пользователей и пагинация.
+
+    ``totals``:
+
+    * ``users`` — всего зарегистрированных (``users.id``);
+    * ``paid`` — оплаченная активная подписка (``sub_until >= today``);
+    * ``active`` — ``paid`` **или** бесплатный доступ из ``free_access``
+      (env-часть whitelist бот добавляет сам, в БД её нет);
+    * ``trial`` — оценка: активные без единого платежа (триал достоверно
+      отличить нельзя, отдельного флага в схеме нет);
+    * ``expired`` — ``users - active`` (остальные, CONTRACT §22);
+    * ``free`` — число записей whitelist в ``free_access`` (env-часть дополнит бот);
+    * ``ai_active`` — ``ai_until >= today``;
+    * ``revenue`` — ``{"rub", "rub_count", "xtr", "xtr_count", "count"}``
+      по таблице ``payments`` (RUB и XTR раздельно, только реальные платежи).
+
+    ``rows`` — пользователи по ``ORDER BY users.id DESC`` с ``LIMIT/OFFSET``:
+    ``user_id``, ``first_name``, ``username``, ``created_at``, ``sub_until``,
+    ``ai_until``, ``ai_enabled`` и ``payments`` (сколько платежей у человека —
+    по нему бот отличает триал от оплаты).
+
+    ``total``/``page``/``pages``/``has_prev``/``has_next`` — пагинация; запрошенная
+    страница за пределами диапазона подрезается к последней.
+    """
+    try:
+        day = str(today)[:10]
+    except Exception:  # noqa: BLE001 — мусор вместо даты не должен ронять /users
+        day = calc.local_today()
+    limit = max(int(limit or 10), 1)
+    offset = max(int(offset or 0), 0)
+
+    sub_active = _DATE_ACTIVE_SQL.format(column="p.sub_until")
+    ai_active = _DATE_ACTIVE_SQL.format(column="p.ai_until")
+    joined = "FROM users u LEFT JOIN profiles p ON p.user_id = u.id"
+
+    users = _overview_count(conn, "SELECT COUNT(*) FROM users")
+    paid = _overview_count(
+        conn, f"SELECT COUNT(*) {joined} WHERE {sub_active}", (day,)
+    )
+    active = _overview_count(
+        conn,
+        f"SELECT COUNT(*) {joined} WHERE {sub_active} OR {_FREE_MATCH_SQL}",
+        (day,),
+    )
+    # Если free_access в старой базе нет — активных не меньше оплаченных.
+    active = max(active, paid)
+    trial = _overview_count(
+        conn,
+        f"SELECT COUNT(*) {joined} WHERE {sub_active} "
+        "AND NOT EXISTS (SELECT 1 FROM payments pay WHERE pay.user_id = u.id)",
+        (day,),
+    )
+    free = _overview_count(conn, "SELECT COUNT(*) FROM free_access")
+    ai_total = _overview_count(
+        conn, f"SELECT COUNT(*) {joined} WHERE {ai_active}", (day,)
+    )
+    expired = max(users - active, 0)
+
+    revenue = {"rub": 0.0, "rub_count": 0, "xtr": 0.0, "xtr_count": 0, "count": 0}
+    try:
+        for row in conn.execute(
+            "SELECT currency, COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total "
+            "FROM payments GROUP BY currency"
+        ):
+            currency = str(row["currency"] or "").upper()
+            count = int(row["cnt"] or 0)
+            total = float(row["total"] or 0)
+            if currency == "RUB":
+                revenue["rub"] = total
+                revenue["rub_count"] = count
+            elif currency == "XTR":
+                revenue["xtr"] = total
+                revenue["xtr_count"] = count
+    except sqlite3.Error:
+        log.exception("admin_users_overview: не удалось посчитать платежи")
+    revenue["count"] = revenue["rub_count"] + revenue["xtr_count"]
+
+    total = users
+    pages = max(1, (total + limit - 1) // limit)
+    page = offset // limit + 1
+    if page < 1:
+        page = 1
+    if page > pages:
+        page = pages
+        offset = (page - 1) * limit
+
+    rows_sql = (
+        "SELECT u.id AS user_id, u.first_name AS first_name, u.username AS username, "
+        "u.created_at AS created_at, p.sub_until AS sub_until, p.ai_until AS ai_until, "
+        "COALESCE(p.ai_enabled, 0) AS ai_enabled, "
+        "(SELECT COUNT(*) FROM payments pay WHERE pay.user_id = u.id) AS payments "
+        f"{joined} ORDER BY u.id DESC LIMIT ? OFFSET ?"
+    )
+    try:
+        rows = [dict(row) for row in conn.execute(rows_sql, (limit, offset))]
+    except sqlite3.Error:
+        log.exception("admin_users_overview: payments недоступны, читаю без них")
+        fallback_sql = (
+            "SELECT u.id AS user_id, u.first_name AS first_name, "
+            "u.username AS username, u.created_at AS created_at, "
+            "p.sub_until AS sub_until, p.ai_until AS ai_until, "
+            "COALESCE(p.ai_enabled, 0) AS ai_enabled, 0 AS payments "
+            f"{joined} ORDER BY u.id DESC LIMIT ? OFFSET ?"
+        )
+        rows = [dict(row) for row in conn.execute(fallback_sql, (limit, offset))]
+
+    return {
+        "totals": {
+            "users": users,
+            "paid": paid,
+            "trial": trial,
+            "active": active,
+            "expired": expired,
+            "free": free,
+            "ai_active": ai_total,
+            "revenue": revenue,
+        },
+        "rows": rows,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "page": page,
+        "pages": pages,
+        "has_prev": page > 1,
+        "has_next": page < pages,
+    }
+
+
 # --- рублёвые счета эквайринга (invoices, v6) -----------------------------------
 
 #: Допустимые статусы счёта.
