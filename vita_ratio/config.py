@@ -93,18 +93,29 @@ class Settings:
         return self.app_env.strip().lower() not in {"prod", "production"}
 
 
+_OVERRIDES_CACHE: dict[str, str] | None = None
+
+
 def _private_overrides() -> dict[str, str]:
     """Настройки из приватного data-репозитория: ``config/overrides.json``.
 
     Позволяет менять платёжные ключи/режимы без Render API: файл лежит рядом
     с бэкапом БД, доступ — по уже заданным ``DATA_REPO``/``DATA_TOKEN``.
-    Любая ошибка сети/JSON тихо игнорируется (приложение работает на env).
+    Результат кэшируется на процесс; любая ошибка сети/JSON тихо игнорируется
+    (приложение работает на env). ``SKIP_PRIVATE_OVERRIDES=1`` отключает запрос.
     """
+    global _OVERRIDES_CACHE
+    if _OVERRIDES_CACHE is not None:
+        return _OVERRIDES_CACHE
+    if os.environ.get("SKIP_PRIVATE_OVERRIDES", "").strip().lower() in {"1", "true", "yes", "on"}:
+        _OVERRIDES_CACHE = {}
+        return _OVERRIDES_CACHE
     repo = os.environ.get("DATA_REPO", "").strip()
     token = os.environ.get("DATA_TOKEN", "").strip()
     branch = os.environ.get("DATA_BRANCH", "main").strip() or "main"
     if not repo or not token:
-        return {}
+        _OVERRIDES_CACHE = {}
+        return _OVERRIDES_CACHE
     url = f"https://api.github.com/repos/{repo}/contents/config/overrides.json?ref={branch}"
     request = urllib.request.Request(url, headers={
         "Authorization": "Bearer " + token,
@@ -112,15 +123,17 @@ def _private_overrides() -> dict[str, str]:
         "User-Agent": "vita-config",
     })
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=5) as response:
             payload = json.loads(response.read())
         raw = base64.b64decode(payload.get("content") or "").decode("utf-8")
         data = json.loads(raw)
         if isinstance(data, dict):
-            return {str(key): str(value) for key, value in data.items()}
+            _OVERRIDES_CACHE = {str(key): str(value) for key, value in data.items()}
     except Exception as exc:  # noqa: BLE001 — приватные оверрайды не критичны
         log.warning("config: не удалось прочитать приватные настройки (%s)", type(exc).__name__)
-    return {}
+    if _OVERRIDES_CACHE is None:
+        _OVERRIDES_CACHE = {}
+    return _OVERRIDES_CACHE
 
 
 def settings(from_env: bool = True) -> Settings:
