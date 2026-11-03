@@ -827,33 +827,29 @@
             <button type="button" id="btn-theme-reset" class="btn btn--ghost btn--wide">Сбросить</button>
           </article>
 
-          <article class="card" aria-label="Подписка и ИИ-аддон">
+          <article class="card" aria-label="Подписка">
             <div class="card__head">
               <p class="card__label">Подписка</p>
               <span class="muted">Vita Ratio</span>
             </div>
             <p id="subscription-status" class="subscription-status" hidden></p>
-            <!-- Оплата видна всегда — и при активной подписке/триале/бесплатном
-                 доступе: при активной подписке кнопки работают как продление. -->
-            <div class="sub-buy" aria-label="Оплата подписки и ИИ-аддона">
-              <button type="button" id="sub-buy-btn" class="btn btn--accent btn--wide">Оплатить подписку 250 ₽/мес</button>
-              <p id="sub-buy-stars" class="sub-buy__stars">≈150 Stars</p>
-              <button type="button" id="ai-buy-btn" class="btn btn--ghost btn--wide">Подключить ИИ · +100 ₽/мес</button>
-              <p id="ai-buy-stars" class="sub-buy__stars">≈60 Stars</p>
-              <p id="sub-buy-note" class="paywall__note sub-buy__note" hidden></p>
-              <p id="ai-buy-note" class="paywall__note sub-buy__note" hidden></p>
-            </div>
             <div class="ai-plan-row">
               <div class="ai-plan-info">
                 <p class="ai-plan-title">ИИ-ассистент</p>
-                <p id="ai-plan-status" class="ai-plan-status" aria-live="polite">ИИ +100 ₽/мес</p>
+                <p id="ai-plan-status" class="ai-plan-status" aria-live="polite">ИИ выключен</p>
               </div>
               <button type="button" id="ai-plan-toggle" class="ai-plan-toggle" role="switch"
-                      aria-checked="false" aria-labelledby="ai-plan-status" aria-label="Включить ИИ-аддон">
+                      aria-checked="false" aria-labelledby="ai-plan-status" aria-label="Включить ИИ в подписку">
                 <span class="ai-plan-toggle__knob" aria-hidden="true"></span>
               </button>
             </div>
-            <p class="micro-note">ИИ-аддон — отдельная подписка +100 ₽/мес. Переключатель только включает и выключает ИИ: оплаченный период сохраняется.</p>
+            <!-- Одна кнопка оплаты: цена 250 ↔ 350 ₽ пересчитывается при переключении ИИ. -->
+            <div class="sub-buy" aria-label="Оплата подписки">
+              <button type="button" id="sub-buy-btn" class="btn btn--accent btn--wide">Оплатить 250 ₽/мес</button>
+              <p id="sub-buy-stars" class="sub-buy__stars">≈150 Stars</p>
+              <p id="sub-buy-note" class="paywall__note sub-buy__note" hidden></p>
+            </div>
+            <p class="micro-note">Ползунок включает ИИ в подписку: при включении цена меняется 250 → 350 ₽/мес.</p>
           </article>
         </div>
       </section>

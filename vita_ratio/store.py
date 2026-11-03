@@ -858,8 +858,9 @@ def stats_days(conn: sqlite3.Connection, user_id: int, date_from: str, date_to: 
 
 
 # --- подписка и платежи (Telegram Stars, CONTRACT §22) -------------------------
-#: Допустимые виды платежа: base = подписка на бота, ai = аддон ИИ-разбора.
-PAYMENT_KINDS = ("base", "ai")
+#: Допустимые виды платежа: base = подписка, ai = аддон ИИ-разбора,
+#: pro = подписка + ИИ-разбор одним платежом.
+PAYMENT_KINDS = ("base", "ai", "pro")
 
 
 def get_subscription(conn: sqlite3.Connection, user_id: int) -> dict:
@@ -991,7 +992,7 @@ def add_payment(
     """
     normalized = str(kind or "").strip().lower()
     if normalized not in PAYMENT_KINDS:
-        raise ValueError("kind платежа должен быть base или ai")
+        raise ValueError("kind платежа должен быть base, ai или pro")
     cursor = conn.execute(
         """
         INSERT OR IGNORE INTO payments (user_id, kind, charge_id, amount, currency, payload)
@@ -1193,7 +1194,7 @@ def create_invoice(
     """
     normalized = str(kind or "").strip().lower()
     if normalized not in PAYMENT_KINDS:
-        raise ValueError("kind счёта должен быть base или ai")
+        raise ValueError("kind счёта должен быть base, ai или pro")
     external = str(external_id or "").strip()
     if not external:
         raise ValueError("external_id счёта не может быть пустым")

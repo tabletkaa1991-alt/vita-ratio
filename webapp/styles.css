@@ -3286,6 +3286,7 @@ body.paywall-open {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  margin: 0 0 14px;
   padding: 12px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border-soft);

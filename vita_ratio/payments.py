@@ -26,7 +26,21 @@ ROBOKASSA_URL = "https://auth.robokassa.ru/Merchant/Index.aspx"
 
 
 def rub_price(settings: Settings, kind: str) -> int:
-    return settings.base_price_rub if kind == "base" else settings.ai_price_rub
+    """Цена в рублях: base — подписка, ai — аддон, pro — подписка + аддон."""
+    if kind == "base":
+        return settings.base_price_rub
+    if kind == "pro":
+        return settings.base_price_rub + settings.ai_price_rub
+    return settings.ai_price_rub
+
+
+def stars_price(settings: Settings, kind: str) -> int:
+    """Цена в Telegram Stars: base, ai, pro — сумма base + ai."""
+    if kind == "base":
+        return settings.base_price_stars
+    if kind == "pro":
+        return settings.base_price_stars + settings.ai_price_stars
+    return settings.ai_price_stars
 
 
 def provided(settings: Settings) -> bool:
@@ -65,6 +79,7 @@ def create_yookassa(settings: Settings, user_id: int, kind: str) -> dict:
             "return_url": f"{settings.app_url}/?paid={kind}",
         },
         "description": ("Vita Ratio — подписка на бота (30 дней)" if kind == "base"
+                        else "Vita Ratio — подписка + ИИ (30 дней)" if kind == "pro"
                         else "Vita Ratio — ИИ-разбор (30 дней)"),
         "metadata": {"user_id": int(user_id), "kind": kind},
     }

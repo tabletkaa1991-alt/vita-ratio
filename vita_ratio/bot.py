@@ -827,6 +827,8 @@ def _payment_text(kind: str, until: str, duplicate: bool = False) -> str:
         return "✅ Платёж уже учтён — подписка не продлевается повторно."
     if kind == "ai":
         return f"✅ ИИ-разбор подключён до {until}"
+    if kind == "pro":
+        return "✅ Подписка + ИИ активированы"
     return f"✅ Подписка на Vita Ratio активна до {until}"
 
 
@@ -896,11 +898,21 @@ def apply_payment(
         }
 
     today = calc.local_today(settings_obj.timezone)
-    until = _payment_until(payment, current, today, settings_obj)
-    store.set_subscription(conn, uid, **{field: until})
-    if kind == "ai":
-        # Аддон оплачен -> включаем ИИ в профиле (CONTRACT §22).
+    if kind == "pro":
+        # pro = подписка + ИИ: продлеваем обе даты и включаем ИИ.
+        sub_current = _dget(profile, "sub_until", None)
+        ai_current = _dget(profile, "ai_until", None)
+        sub_until = _payment_until(payment, sub_current, today, settings_obj)
+        ai_until = _payment_until(payment, ai_current, today, settings_obj)
+        store.set_subscription(conn, uid, sub_until=sub_until, ai_until=ai_until)
         store.upsert_profile(conn, uid, {"ai_enabled": 1})
+        until = sub_until
+    else:
+        until = _payment_until(payment, current, today, settings_obj)
+        store.set_subscription(conn, uid, **{field: until})
+        if kind == "ai":
+            # Аддон оплачен -> включаем ИИ в профиле (CONTRACT §22).
+            store.upsert_profile(conn, uid, {"ai_enabled": 1})
     text = _payment_text(kind, until)
     log.info(
         "successful_payment: user_id=%s kind=%s until=%s charge=%s amount=%s %s",

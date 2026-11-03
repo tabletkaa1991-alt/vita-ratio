@@ -152,7 +152,7 @@ CREATE INDEX IF NOT EXISTS idx_notes_user_date ON notes(user_id, date);
 CREATE TABLE IF NOT EXISTS payments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    kind       TEXT    NOT NULL CHECK (kind IN ('base', 'ai')),
+    kind       TEXT    NOT NULL CHECK (kind IN ('base', 'ai', 'pro')),
     charge_id  TEXT    NOT NULL UNIQUE,
     amount     INTEGER NOT NULL,
     currency   TEXT    NOT NULL DEFAULT 'XTR',
@@ -164,7 +164,7 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE TABLE IF NOT EXISTS invoices (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    kind        TEXT    NOT NULL CHECK (kind IN ('base', 'ai')),
+    kind        TEXT    NOT NULL CHECK (kind IN ('base', 'ai', 'pro')),
     provider    TEXT    NOT NULL DEFAULT 'yookassa',
     external_id TEXT    NOT NULL UNIQUE,  -- id платежа у провайдера (YooKassa payment id / Robokassa InvId)
     amount_rub  REAL    NOT NULL,

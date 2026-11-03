@@ -272,7 +272,16 @@ def invoice_product(settings_obj, kind: str) -> dict:
             "price_rub": int(settings_obj.ai_price_rub),
             "period_days": days,
         }
-    raise ApiError(400, "bad_request", "Поле «kind» должно быть base или ai")
+    if kind == "pro":
+        return {
+            "kind": "pro",
+            "title": "Vita Ratio · подписка (+ИИ)",
+            "description": "Vita Ratio — подписка + ИИ (30 дней)",
+            "price_stars": int(payments.stars_price(settings_obj, "pro")),
+            "price_rub": int(payments.rub_price(settings_obj, "pro")),
+            "period_days": days,
+        }
+    raise ApiError(400, "bad_request", "Поле «kind» должно быть base, ai или pro")
 
 
 async def create_invoice_link(settings_obj, user_id: int, kind: str) -> dict:
@@ -2045,7 +2054,7 @@ async def get_subscription(request: web.Request) -> web.Response:
 
 
 async def post_pay_invoice(request: web.Request) -> web.Response:
-    """POST /api/pay/invoice {"kind":"base"|"ai"} — ссылка на оплату.
+    """POST /api/pay/invoice {"kind":"base"|"ai"|"pro"} — ссылка на оплату.
 
     Если настроен рублёвый эквайринг (``PAY_PROVIDER=yookassa|robokassa`` и
     ключи), создаётся счёт провайдера и возвращается его ``invoice_url``.
@@ -2056,8 +2065,8 @@ async def post_pay_invoice(request: web.Request) -> web.Response:
     conn = _conn(request)
     payload = await _body(request)
     kind = str(payload.get("kind") or "").strip().lower()
-    if kind not in ("base", "ai"):
-        raise _bad("Поле «kind» должно быть base или ai")
+    if kind not in ("base", "ai", "pro"):
+        raise _bad("Поле «kind» должно быть base, ai или pro")
     if kind == "ai":
         profile = store.get_profile(conn, user["id"])
         today = calc.local_today(settings_obj.timezone)
@@ -2204,10 +2213,18 @@ def _activate_provider_payment(
             "kind": normalized, "until": None, "error": "",
         }
     until = _payment_until(conn, settings_obj, uid, normalized)
-    field = "ai_until" if normalized == "ai" else "sub_until"
-    store.set_subscription(conn, uid, **{field: until})
-    if normalized == "ai":
+    if normalized == "pro":
+        # pro = подписка + ИИ: продлеваем обе даты и включаем ИИ.
+        sub_until = _payment_until(conn, settings_obj, uid, "base")
+        ai_until = _payment_until(conn, settings_obj, uid, "ai")
+        store.set_subscription(conn, uid, sub_until=sub_until, ai_until=ai_until)
         store.upsert_profile(conn, uid, {"ai_enabled": 1})
+        until = sub_until
+    else:
+        field = "ai_until" if normalized == "ai" else "sub_until"
+        store.set_subscription(conn, uid, **{field: until})
+        if normalized == "ai":
+            store.upsert_profile(conn, uid, {"ai_enabled": 1})
     log.info(
         "activate: user_id=%s kind=%s until=%s charge=%s amount=%s %s",
         uid, normalized, until, charge, amount_int, currency,
@@ -2399,7 +2416,7 @@ async def get_pay_robokassa_success(request: web.Request) -> web.Response:
 
 
 async def post_pay_refresh(request: web.Request) -> web.Response:
-    """POST /api/pay/refresh {"kind": "base"|"ai"} — досрочная проверка счёта.
+    """POST /api/pay/refresh {"kind": "base"|"ai"|"pro"} — досрочная проверка счёта.
 
     ЮKassa подтверждает платёж через API (вебхук может запаздывать), Robokassa —
     только вебхуком, поэтому для неё просто возвращается текущий статус.
@@ -2410,8 +2427,8 @@ async def post_pay_refresh(request: web.Request) -> web.Response:
     conn = _conn(request)
     payload = await _body(request)
     kind = str(payload.get("kind") or "").strip().lower()
-    if kind not in ("base", "ai"):
-        raise _bad("Поле «kind» должно быть base или ai")
+    if kind not in ("base", "ai", "pro"):
+        raise _bad("Поле «kind» должно быть base, ai или pro")
     invoice = store.find_pending_invoice(conn, user["id"], kind)
     if invoice is not None and str(invoice.get("provider") or "") == "yookassa":
         external_id = str(invoice.get("external_id") or "").strip()

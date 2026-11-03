@@ -64,10 +64,80 @@ def migrate(conn: sqlite3.Connection) -> list[str]:
     return applied
 
 
+#: DDL таблиц платежей с расширенным CHECK kind (base/ai/pro). SQLite не умеет
+#: менять CHECK-ограничение через ALTER TABLE, поэтому таблицы пересоздаются.
+_PAYMENTS_DDL = """
+CREATE TABLE payments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind       TEXT    NOT NULL CHECK (kind IN ('base', 'ai', 'pro')),
+    charge_id  TEXT    NOT NULL UNIQUE,
+    amount     INTEGER NOT NULL,
+    currency   TEXT    NOT NULL DEFAULT 'XTR',
+    payload    TEXT    NOT NULL DEFAULT '',
+    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
+_INVOICES_DDL = """
+CREATE TABLE invoices (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind        TEXT    NOT NULL CHECK (kind IN ('base', 'ai', 'pro')),
+    provider    TEXT    NOT NULL DEFAULT 'yookassa',
+    external_id TEXT    NOT NULL UNIQUE,
+    amount_rub  REAL    NOT NULL,
+    status      TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'succeeded', 'canceled')),
+    payload     TEXT    NOT NULL DEFAULT '',
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
+_PAYMENTS_COLS = "id, user_id, kind, charge_id, amount, currency, payload, created_at"
+_INVOICES_COLS = "id, user_id, kind, provider, external_id, amount_rub, status, payload, created_at"
+
+
+def _table_has_pro_kind(conn: sqlite3.Connection, table: str) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        return True
+    return bool(row and "kind IN ('base', 'ai', 'pro')" in str(row["sql"] or ""))
+
+
+def _migrate_payment_kinds(conn: sqlite3.Connection) -> list[str]:
+    """Расширяет CHECK kind у payments/invoices до base/ai/pro (идемпотентно).
+
+    Существующие строки переносятся в пересозданные таблицы без потерь.
+    Возвращает имена пересозданных таблиц.
+    """
+    applied: list[str] = []
+    for table, ddl, cols in (
+        ("payments", _PAYMENTS_DDL, _PAYMENTS_COLS),
+        ("invoices", _INVOICES_DDL, _INVOICES_COLS),
+    ):
+        if _table_has_pro_kind(conn, table):
+            continue
+        tmp = f"{table}_new"
+        conn.execute(ddl.replace(f"CREATE TABLE {table}", f"CREATE TABLE {tmp}"))
+        conn.execute(f"INSERT INTO {tmp} ({cols}) SELECT {cols} FROM {table}")
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {tmp} RENAME TO {table}")
+        applied.append(table)
+    if "invoices" in applied:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_invoices_user ON invoices(user_id)"
+        )
+    return applied
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     """Создаёт таблицы из schema.sql и догоняет схему миграциями (идемпотентно)."""
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
     migrate(conn)
+    _migrate_payment_kinds(conn)
     conn.commit()
 
 

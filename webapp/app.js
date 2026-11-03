@@ -112,7 +112,7 @@
     },
     /* Подписка (CONTRACT §22–25): GET /api/subscription + bootstrap.subscription. */
     subscription: { data: null, loading: false, loaded: false, reload: false, missing: false },
-    pay: { baseBusy: false, aiBusy: false, aiToggleBusy: false, forcePaywall: false },
+    pay: { baseBusy: false, aiBusy: false, forcePaywall: false, includeAi: null },
     theme: {
       accent: DEFAULT_THEME.accent,
       bg: DEFAULT_THEME.bg,
@@ -966,38 +966,52 @@
     node.classList.toggle('subscription-status--trial', sub.active && subscriptionIsTrial(sub));
   }
 
-  /* Кнопки оплаты в карточке «Подписка» (#screen-settings) видны всегда:
-     при активной подписке/триале/бесплатном доступе они становятся продлением,
-     поэтому оплату можно проверить в любом состоянии аккаунта. Цены в рублях
-     и Stars берём из /api/subscription (фолбэк — SUBSCRIPTION_DEFAULTS). */
-  function renderSettingsBilling(sub) {
+  /* Локальный выбор «включить ИИ в подписку» (state.pay.includeAi):
+     null — следовать ai_active из /api/subscription (продление сохраняет ИИ),
+     true/false — явный выбор пользователя тумблером. Сеть не трогаем. */
+  function billingIncludeAi(sub) {
     var data = sub || subscriptionPayload();
-    var rub = data ? data.base_price_rub : SUBSCRIPTION_DEFAULTS.base_price_rub;
-    var stars = data ? data.base_price_stars : SUBSCRIPTION_DEFAULTS.base_price_stars;
+    if (state.pay.includeAi === true || state.pay.includeAi === false) {
+      return state.pay.includeAi;
+    }
+    return !!(data && data.ai_active === true);
+  }
+
+  /* Цена одной кнопки оплаты: base 250 ₽/150 Stars, pro (base+ИИ) 350 ₽/210 Stars. */
+  function billingPrice(sub) {
+    var data = sub || subscriptionPayload();
+    var baseRub = data ? data.base_price_rub : SUBSCRIPTION_DEFAULTS.base_price_rub;
+    var baseStars = data ? data.base_price_stars : SUBSCRIPTION_DEFAULTS.base_price_stars;
     var aiRub = data ? data.ai_price_rub : SUBSCRIPTION_DEFAULTS.ai_price_rub;
     var aiStars = data ? data.ai_price_stars : SUBSCRIPTION_DEFAULTS.ai_price_stars;
+    if (billingIncludeAi(data)) {
+      return { rub: baseRub + aiRub, stars: baseStars + aiStars, kind: 'pro' };
+    }
+    return { rub: baseRub, stars: baseStars, kind: 'base' };
+  }
+
+  /* После оплаты/возврата сбрасываем локальный выбор: цена снова следует ai_active. */
+  function resetIncludeAi() {
+    state.pay.includeAi = null;
+  }
+
+  /* Одна кнопка оплаты в карточке «Подписка» (#screen-settings) видна всегда:
+     при активной подписке/триале/бесплатном доступе она становится продлением.
+     Цена зависит от ползунка «ИИ»: 250 ↔ 350 ₽ / 150 ↔ 210 Stars. */
+  function renderSettingsBilling(sub) {
+    var data = sub || subscriptionPayload();
+    var price = billingPrice(data);
     var baseActive = !!(data && data.active === true);
-    var aiActive = !!(data && data.ai_active === true);
     var subButton = byId('sub-buy-btn');
     var subStarsNode = byId('sub-buy-stars');
-    var aiButton = byId('ai-buy-btn');
-    var aiStarsNode = byId('ai-buy-stars');
 
     if (subButton) {
-      subButton.textContent = (baseActive ? 'Продлить подписку ' : 'Оплатить подписку ') +
-        fmtInt(rub) + ' ₽/мес';
+      subButton.textContent = (baseActive ? 'Продлить ' : 'Оплатить ') +
+        fmtInt(price.rub) + ' ₽/мес';
     }
     if (subStarsNode) {
-      subStarsNode.textContent = '≈' + fmtInt(stars) + ' Stars';
-      subStarsNode.hidden = !(stars > 0);
-    }
-    if (aiButton) {
-      aiButton.textContent = (aiActive ? 'Продлить ИИ · +' : 'Подключить ИИ · +') +
-        fmtInt(aiRub) + ' ₽/мес';
-    }
-    if (aiStarsNode) {
-      aiStarsNode.textContent = '≈' + fmtInt(aiStars) + ' Stars';
-      aiStarsNode.hidden = !(aiStars > 0);
+      subStarsNode.textContent = '≈' + fmtInt(price.stars) + ' Stars';
+      subStarsNode.hidden = !(price.stars > 0);
     }
   }
 
@@ -1113,7 +1127,7 @@
     }
   }
 
-  /* Возврат со страницы оплаты (?paid=base|ai): досрочно проверяем счёт
+  /* Возврат со страницы оплаты (?paid=base|ai|pro): досрочно проверяем счёт
      (у ЮKassa вебхук может запаздывать) и перечитываем bootstrap. */
   function refreshPaidInvoice(kind) {
     apiRequest('POST', '/api/pay/refresh', { kind: kind }).catch(function () {
@@ -1143,6 +1157,7 @@
   }
 
   function afterPaymentRefresh() {
+    resetIncludeAi();
     loadBootstrap({ force: true });
     loadSubscription({ force: true });
   }
@@ -1158,7 +1173,7 @@
       }
       state.aiChat.forcePaywall = false;
       renderAiPlan(subscriptionPayload());
-      /* Кнопка #ai-buy-btn сразу становится «Продлить ИИ · +100 ₽/мес». */
+      /* Кнопка оплаты в настройках сразу отражает актуальный ai_active. */
       renderSettingsBilling(subscriptionPayload());
       loadSubscription({ force: true });
     }).catch(function () {
@@ -1204,23 +1219,27 @@
     }
   }
 
-  /* Оплата базовой подписки: блокирующий paywall (#sub-pay-btn) и кнопка
-     в «Настройках» (#sub-buy-btn) используют один и тот же POST /api/pay/invoice
-     kind=base. opts.buttonId/noteId позволяют показать занятость и подсказку
-     со ссылкой на счёт именно в той карточке, откуда пришёл клик. */
+  /* Оплата подписки: блокирующий paywall (#sub-pay-btn, kind=base) и кнопка
+     в «Настройках» (#sub-buy-btn, kind=base|pro в зависимости от includeAi)
+     используют один и тот же POST /api/pay/invoice. opts.buttonId/noteId/kind
+     позволяют показать занятость и подсказку со ссылкой на счёт именно в той
+     карточке, откуда пришёл клик. */
   function payBase(options) {
     var opts = options || {};
     if (state.pay.baseBusy) { return; }
     var buttonId = opts.buttonId || 'sub-pay-btn';
     var noteId = opts.noteId || 'sub-pay-note';
+    var kind = opts.kind || 'base';
     var button = byId(buttonId);
     var sub = subscriptionPayload();
-    var rub = sub ? sub.base_price_rub : SUBSCRIPTION_DEFAULTS.base_price_rub;
+    var price = kind === 'pro'
+      ? billingPrice(sub)
+      : { rub: sub ? sub.base_price_rub : SUBSCRIPTION_DEFAULTS.base_price_rub };
     state.pay.baseBusy = true;
     setBusy(button, true);
-    hideInvoiceHint('base', noteId);
+    hideInvoiceHint(kind, noteId);
     haptic('select');
-    requestInvoice('base').then(function (data) {
+    requestInvoice(kind).then(function (data) {
       state.pay.baseBusy = false;
       setBusy(button, false);
       if (data.provider && data.provider !== 'stars') {
@@ -1230,11 +1249,11 @@
         return;
       }
       var opened = openInvoice(data.invoice_url, function (status) {
-        handleInvoiceStatus('base', status);
+        handleInvoiceStatus(kind, status);
       });
       if (!opened) {
-        showInvoiceHint('base', data.invoice_url, noteId);
-        toast('Готово: оплати ' + fmtInt(rub) + ' ₽ в Telegram');
+        showInvoiceHint(kind, data.invoice_url, noteId);
+        toast('Готово: оплати ' + fmtInt(price.rub) + ' ₽ в Telegram');
       }
     }).catch(function (error) {
       state.pay.baseBusy = false;
@@ -1279,9 +1298,8 @@
       haptic('error');
       var code = error && error.code;
       if (code === 'base_required') {
-        /* Аддон без base. Кнопка #ai-buy-btn из «Настроек» только показывает
-           тост (рядом есть кнопка оплаты base), а paywall экрана «ИИ» и
-           модалка из настроек по-прежнему открывают базовый paywall. */
+        /* Аддон без base: paywall экрана «ИИ» и модалка из настроек
+           открывают базовый paywall. */
         if (opts.forceBasePaywall !== false) {
           state.pay.forcePaywall = true;
           renderSubscription();
@@ -1304,10 +1322,9 @@
 
   /* ======================= экран «Настройки» (CONTRACT §36–37) ======================= */
 
-  /* Единый рендер тумблера ИИ-аддона. Источник данных — /api/subscription:
-     ai_active — эффективный доступ (флаг И срок/free), ai_enabled — сырой флаг,
-     ai_until — оплаченная дата. Наличие аддона определяем по free/ai_until,
-     чтобы отличить «оплачен, но выключен» от «аддона нет». */
+  /* Единый рендер тумблера «ИИ в подписке». Положение — из локального
+     state.pay.includeAi (по умолчанию следует ai_active из /api/subscription),
+     подпись — «ИИ включён · +100 ₽/мес» / «ИИ выключен». Сеть не трогаем. */
   function renderAiPlan(sub) {
     var data = sub || subscriptionPayload();
     var toggle = byId('ai-plan-toggle');
@@ -1317,8 +1334,7 @@
     var payButton = byId('ai-plan-pay-btn');
     var rub = data ? data.ai_price_rub : SUBSCRIPTION_DEFAULTS.ai_price_rub;
     var stars = data ? data.ai_price_stars : SUBSCRIPTION_DEFAULTS.ai_price_stars;
-    var enabled = !!(data && data.ai_active === true);
-    var addonActive = !!(data && (data.free === true || dateActive(data.ai_until)));
+    var enabled = billingIncludeAi(data);
 
     if (priceNode) { priceNode.textContent = fmtInt(rub); }
     if (starsNode) { starsNode.textContent = fmtInt(stars); }
@@ -1326,22 +1342,10 @@
     if (toggle) {
       toggle.classList.toggle('is-on', enabled);
       toggle.setAttribute('aria-checked', enabled ? 'true' : 'false');
-      toggle.setAttribute('aria-label', enabled ? 'Выключить ИИ-аддон' : 'Включить ИИ-аддон');
-      setBusy(toggle, !!state.pay.aiToggleBusy);
+      toggle.setAttribute('aria-label', enabled ? 'Выключить ИИ в подписке' : 'Включить ИИ в подписку');
     }
     if (!status) { return; }
-
-    if (addonActive) {
-      if (!enabled) {
-        status.textContent = 'ИИ выключен';
-        return;
-      }
-      status.textContent = data.ai_until
-        ? 'ИИ включён · до ' + dateShort(data.ai_until)
-        : 'ИИ включён';
-      return;
-    }
-    status.textContent = 'ИИ ' + aiPriceLabel(data);
+    status.textContent = enabled ? 'ИИ включён · ' + aiPriceLabel(data) : 'ИИ выключен';
   }
 
   function renderSettings() {
@@ -1375,60 +1379,15 @@
     if (event.key === 'Escape') { closeAiPlanPaywall(); }
   }
 
-  /* Тумблер: выключение -> PUT false (всегда 200); включение -> PUT true.
-     При активном аддоне 200, окно оплаты НЕ показываем. Если аддона нет,
-     backend отвечает 402 ai_subscription_required (или 200 с ai_enabled=false
-     в dev-режиме) — тогда открываем модалку оплаты ИИ-аддона. */
+  /* Тумблер — ЛОКАЛЬНЫЙ выбор «включить ИИ в подписку»: не шлёт PUT /api/ai
+     и не открывает paywall, только переключает state.pay.includeAi и
+     пересчитывает цену кнопки оплаты (250 ↔ 350 ₽ / 150 ↔ 210 Stars). */
   function onAiPlanToggle() {
-    if (state.pay.aiToggleBusy) { return; }
-    var sub = subscriptionPayload();
-    /* ai_active — эффективный доступ: именно он определяет положение тумблера. */
-    var enabled = !!(sub && sub.ai_active === true);
-    state.pay.aiToggleBusy = true;
-    renderAiPlan(sub);
+    var current = billingIncludeAi();
+    state.pay.includeAi = !current;
     haptic('select');
-
-    apiRequest('PUT', '/api/ai', { enabled: !enabled }).then(function (data) {
-      state.pay.aiToggleBusy = false;
-      if (enabled) {
-        /* Выключение: оплаченный период сохраняется, ИИ просто не работает. */
-        var offSub = subscriptionPayload();
-        if (offSub) {
-          offSub.ai_enabled = false;
-          offSub.ai_active = false;
-        }
-        renderAiPlan(offSub);
-        haptic('success');
-        toast('ИИ выключен');
-        loadSubscription({ force: true });
-        return;
-      }
-      if (data && data.ai_enabled === true) {
-        /* Аддон уже активен — повторное включение без окна оплаты. */
-        var onSub = subscriptionPayload();
-        if (onSub) {
-          onSub.ai_enabled = true;
-          onSub.ai_active = true;
-        }
-        renderAiPlan(onSub);
-        haptic('success');
-        toast('ИИ включён');
-        loadSubscription({ force: true });
-        return;
-      }
-      openAiPlanPaywall();
-    }).catch(function (error) {
-      state.pay.aiToggleBusy = false;
-      renderAiPlan(subscriptionPayload());
-      var code = error && error.code;
-      if (code === 'ai_subscription_required' || code === 'http_402') {
-        loadSubscription({ force: true });
-        openAiPlanPaywall();
-        return;
-      }
-      haptic('error');
-      toast(errorText(code), 'error');
-    });
+    renderAiPlan(subscriptionPayload());
+    renderSettingsBilling(subscriptionPayload());
   }
 
   /* ======================= экран «Сегодня» ======================= */
@@ -4658,16 +4617,13 @@
       if (event.target === byId('ai-plan-paywall')) { closeAiPlanPaywall(); }
     });
 
-    // Настройки: всегда видимые кнопки оплаты/продления (kind=base / kind=ai)
+    // Настройки: одна всегда видимая кнопка оплаты/продления
+    // (kind=base|pro в зависимости от ползунка «ИИ»).
     byId('sub-buy-btn').addEventListener('click', function () {
-      payBase({ buttonId: 'sub-buy-btn', noteId: 'sub-buy-note' });
-    });
-    byId('ai-buy-btn').addEventListener('click', function () {
-      payAiAddon({
-        buttonId: 'ai-buy-btn',
-        noteId: 'ai-buy-note',
-        forceBasePaywall: false,
-        baseRequiredToast: 'Сначала оформите подписку 250 ₽/мес'
+      payBase({
+        buttonId: 'sub-buy-btn',
+        noteId: 'sub-buy-note',
+        kind: billingIncludeAi() ? 'pro' : 'base'
       });
     });
 
@@ -4720,9 +4676,9 @@
     switchTab('today', { force: true });
     loadBootstrap(); // цели нужны любому экрану, даже если стартовая вкладка не «Сегодня»
 
-    /* Возврат со страницы рублёвой оплаты: ?paid=base|ai -> refresh + bootstrap. */
+    /* Возврат со страницы рублёвой оплаты: ?paid=base|ai|pro -> refresh + bootstrap. */
     var paid = params && params.get('paid');
-    if (paid === 'base' || paid === 'ai') {
+    if (paid === 'base' || paid === 'ai' || paid === 'pro') {
       refreshPaidInvoice(paid);
       try {
         params.delete('paid');
