@@ -95,8 +95,15 @@ def is_free(
             uid = int(user_id)
         except (TypeError, ValueError):
             uid = None
-        if uid is not None and uid in _ids(settings.free_access_ids):
-            return True
+        if uid is not None:
+            try:
+                admin_id = int(getattr(settings, "admin_id", 0) or 0)
+            except (TypeError, ValueError):
+                admin_id = 0
+            if admin_id and uid == admin_id:
+                return True
+            if uid in _ids(settings.free_access_ids):
+                return True
     name = normalize(username)
     if name and name in _usernames(settings.free_access_usernames):
         return True

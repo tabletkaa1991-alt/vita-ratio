@@ -109,12 +109,12 @@ def ai_active(profile: dict | None, today: str) -> bool:
 def effective_ai(profile: dict | None, today: str, free: bool = False) -> bool:
     """Эффективный ИИ: флаг включён пользователем И срок до сегодня.
 
-    Для пользователей из белого списка (CONTRACT §29/§37–38) срок не нужен,
-    но флаг ``ai_enabled`` уважается: выключил тумблер — ИИ не работает.
+    Админ/whitelist (free) получают ИИ всегда, независимо от флага — тумблер
+    «ИИ» в настройках теперь только управляет ценой покупки, а не доступом.
     """
     enabled = bool((profile or {}).get("ai_enabled"))
     if free:
-        return enabled
+        return True
     return enabled and ai_active(profile, today)
 
 

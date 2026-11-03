@@ -127,20 +127,21 @@ def is_ai_available(
     if not profile:
         return False
     try:
-        enabled = int(_dget(profile, "ai_enabled", 0) or 0) == 1
-    except (TypeError, ValueError):
-        enabled = False
-    if not enabled:
-        return False
-    try:
         free = bool(
             access.is_free(settings_obj, user_id=user_id, username=username, conn=conn)
         )
     except Exception:  # noqa: BLE001 — whitelist не должен ронять гейт
         log.exception("ai: не удалось проверить бесплатный доступ")
         free = False
+    # Админ/whitelist получают ИИ всегда, независимо от флага ai_enabled.
     if free:
         return True
+    try:
+        enabled = int(_dget(profile, "ai_enabled", 0) or 0) == 1
+    except (TypeError, ValueError):
+        enabled = False
+    if not enabled:
+        return False
     if today is None:
         timezone = getattr(settings_obj, "timezone", None) or DEFAULT_TIMEZONE
         today = calc.local_today(timezone)
