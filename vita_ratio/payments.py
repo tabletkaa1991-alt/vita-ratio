@@ -67,7 +67,6 @@ def create_yookassa(settings: Settings, user_id: int, kind: str) -> dict:
         "description": ("Vita Ratio — подписка на бота (30 дней)" if kind == "base"
                         else "Vita Ratio — ИИ-разбор (30 дней)"),
         "metadata": {"user_id": int(user_id), "kind": kind},
-        "save_payment_method": True,
     }
     headers = {
         "Idempotence-Key": str(uuid.uuid4()),
